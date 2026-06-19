@@ -54,12 +54,7 @@ defmodule DevpulseAgent.Application do
       |> maybe_update_server(server)
 
     File.write!(config_file, updated)
-
-    if DevpulseAgent.Env.dev?() do
-      IO.puts("✅ Configuration saved to #{config_file}")
-    else
-      IO.puts("✅ Configuration saved to file...")
-    end
+    IO.puts("✅ Configuration saved to file...")
   end
 
   defp maybe_update_token(content, nil), do: content

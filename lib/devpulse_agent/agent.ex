@@ -16,10 +16,8 @@ defmodule DevpulseAgent.Agent do
     # Generate a unique session ID for this specific terminal instance
     session_id = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
 
-    if DevpulseAgent.Env.dev?() do
-      Logger.info("DevPulse bound to: #{target_dir}")
-      Logger.debug("Session ID: #{session_id}")
-    end
+    Logger.debug("DevPulse bound to: #{target_dir}")
+    Logger.debug("Session ID: #{session_id}")
 
     state = %{
       target_dir: target_dir,
@@ -60,9 +58,7 @@ defmodule DevpulseAgent.Agent do
   defp get_cli_token do
     case Application.get_env(:devpulse_agent, :cli_token) do
       token when is_binary(token) and token != "" ->
-        if DevpulseAgent.Env.dev?() do
-          Logger.debug("Using token from CLI flag")
-        end
+        Logger.debug("Using token from CLI flag")
 
         token
 
@@ -94,9 +90,7 @@ defmodule DevpulseAgent.Agent do
              System.monotonic_time(:millisecond) - last_sent_time > @force_heartbeat_interval do
           case send_heartbeat(server_url, api_token, state.session_id, metadata) do
             {:ok, _response} ->
-              if DevpulseAgent.Env.dev?() do
-                Logger.debug("Heartbeat sent: #{inspect(metadata)}")
-              end
+              Logger.debug("Heartbeat sent: #{inspect(metadata)}")
 
               new_state = %{
                 state
@@ -107,9 +101,7 @@ defmodule DevpulseAgent.Agent do
               {:noreply, new_state}
 
             {:error, reason} ->
-              if DevpulseAgent.Env.dev?() do
-                Logger.error("Failed to send heartbeat: #{reason}")
-              end
+              Logger.error("Failed to send heartbeat: #{reason}")
 
               {:noreply, state}
           end
