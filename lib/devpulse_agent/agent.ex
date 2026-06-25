@@ -30,28 +30,28 @@ defmodule DevpulseAgent.Agent do
     {:ok, state}
   end
 
-  defp resolve_api_token() do
-    get_cli_token() || get_env_token() || read_token_from_config()
+  defp resolve_api_token(target_dir) do
+    get_cli_token() || get_env_token() || read_token_from_config(target_dir)
   end
 
-  defp read_token_from_config do
-    config_file = Path.expand("~/.config/devpulse/config.toml")
+  defp read_token_from_config(target_dir) do
+    find_and_parse_config(Path.expand(target_dir))
+  end
 
-    if File.exists?(config_file) do
-      case File.read(config_file) do
-        {:ok, content} ->
-          regex = ~r/api_token\s*=\s*"([^"]+)"/
+  defp find_and_parse_config(current_dir) do
+    local_config = Path.join(current_dir, ".devpulse.toml")
 
-          case Regex.run(regex, content) do
-            [_, token] -> token
-            _ -> nil
-          end
+    cond do
+      File.exists?(local_config) ->
+        parse_toml_token(local_config)
 
-        {:error, _} ->
-          nil
-      end
-    else
-      nil
+      current_dir == Path.expand("/") ->
+        global_config = Path.expand("~/.config/devpulse/config.toml")
+        if File.exists?(global_config), do: parse_toml_token(global_config), else: nil
+
+      true ->
+        parent_dir = Path.dirname(current_dir)
+        find_and_parse_config(parent_dir)
     end
   end
 
@@ -69,12 +69,27 @@ defmodule DevpulseAgent.Agent do
 
   defp get_env_token, do: System.get_env("DEVPULSE_TOKEN")
 
+  defp parse_toml_token(file_path) do
+    case File.read(file_path) do
+      {:ok, content} ->
+        regex = ~r/api_token\s*=\s*"([^"]+)"/
+
+        case Regex.run(regex, content) do
+          [_, token] -> token
+          _ -> nil
+        end
+
+      {:error, _} ->
+        nil
+    end
+  end
+
   @impl true
   def handle_info(:check_git, state) do
     File.cd!(state.target_dir)
 
     server_url = Application.fetch_env!(:devpulse_agent, :server_url)
-    api_token = resolve_api_token()
+    api_token = resolve_api_token(state.target_dir)
 
     case DevpulseAgent.Git.get_metadata() do
       nil ->
