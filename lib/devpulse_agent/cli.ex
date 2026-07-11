@@ -718,9 +718,11 @@ defmodule DevpulseAgent.CLI do
     """
 
     IO.puts([IO.ANSI.green(), logo, IO.ANSI.reset()])
-    IO.puts("DevPulse starting")
     IO.puts("Workspace: #{workspace}")
     IO.puts("Team: #{team_slug || "unassigned"}")
+    IO.puts("")
+    IO.puts("🟢 DevPulse Agent started")
+    IO.puts("⏳ Press Ctrl+C to stop")
   end
 
   defp hostname do
