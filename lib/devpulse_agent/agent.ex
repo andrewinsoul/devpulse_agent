@@ -339,10 +339,8 @@ defmodule DevpulseAgent.Agent do
   end
 
   defp hostname do
-    case :inet.gethostname() do
-      {:ok, host} -> List.to_string(host)
-      _ -> "unknown-host"
-    end
+    {:ok, host} = :inet.gethostname()
+    List.to_string(host)
   end
 
   defp hardware_fingerprint(hostname, operating_system, repo_path) do

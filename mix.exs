@@ -32,6 +32,7 @@ defmodule DevpulseAgent.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:dotenvy, "~> 0.8.0"},
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
       {:burrito, "~> 1.0"}

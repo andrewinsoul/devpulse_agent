@@ -32,6 +32,8 @@ If you want extra logs while learning, set:
 export DEVPULSE_LOG_LEVEL=debug
 ```
 
+
+
 ## 3. Create a scratch Git repo
 
 The CLI expects a Git workspace for most commands:
@@ -52,6 +54,8 @@ git config --global user.name "Your Name"
 git config --global user.email "you@example.com"
 ```
 
+
+
 ## 4. Run the smallest commands first
 
 Go back to the Elixir project folder, then try these one by one:
@@ -69,6 +73,8 @@ What to learn here:
 - `config get` shows the current stored settings
 - `config set` shows how local files are written
 
+
+
 ## 5. Test workspace lookup
 
 Now ask the CLI to inspect the scratch repo:
@@ -82,6 +88,8 @@ What to learn here:
 
 - `whoami` tells you what workspace and team the CLI believes it is using
 - `status` shows whether a session exists and what config values are active
+
+
 
 ## 6. Test team linking
 
@@ -101,6 +109,8 @@ What to learn here:
 - if a workspace is already linked to a different team, the CLI should stop instead of overwriting it
 - `login` and `start` now re-save the resolved team after they know the workspace is safe
 
+
+
 ## 7. Test the long-running agent last
 
 `start` is the background loop. It is the best command to inspect with logs, but run it only after the smaller commands are working:
@@ -116,6 +126,28 @@ What to watch for:
 - heartbeat or handshake logs
 - retry or buffer logs when the server is offline
 
+
+
+## 8. Test Developer reauthentication
+
+The developer accepted invite but was not able to complete the process with an alotted time, he just logs in again with his invite token in the CLI
+
+```bash
+ mix run -e 'DevpulseAgent.CLI.main(["login","--token","dp_invite_9LbsUwJTFOjPxvSRAxWMfA"])'
+```
+
+
+
+## 9. Test Developer Accept Invite Process
+
+Ideally, this one is done on the browser and as soon as the developer is done, he is redirected to a page with instructions on how to proceed
+
+```bash
+They click the link on the mail and a form with mail prepopulated and disabled is displayed
+```
+
+
+
 ## 8. Good places for learning logs
 
 Add small `Logger.debug/1` or `Logger.info/1` lines in these places:
@@ -130,6 +162,8 @@ Keep secrets out of logs:
 - do not print `master_api_token`
 - do not print `session_token`
 
+
+
 ## 9. A simple learning order
 
 If your goal is to master Elixir while building this app, this order works well:
@@ -139,6 +173,8 @@ If your goal is to master Elixir while building this app, this order works well:
 3. Learn pattern matching and guards in `Agent`
 4. Learn `GenServer` life cycle events like `init/1`, `handle_info/2`, and `handle_call/3`
 5. Learn supervision with `RunnerSupervisor`
+
+
 
 ## 10. A good test habit
 

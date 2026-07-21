@@ -12,8 +12,8 @@ defmodule DevpulseAgent.Config do
 
   def default_config do
     %{
-      server_url: System.get_env("DEVPULSE_SERVER", "http://localhost:4000"),
-      master_api_token: empty_to_nil(System.get_env("DEVPULSE_TOKEN")),
+      server_url: System.get_env("api_base_url", "http://localhost:4000"),
+      token: empty_to_nil(System.get_env("DEVPULSE_TOKEN")),
       default_team: empty_to_nil(System.get_env("DEVPULSE_TEAM")),
       heartbeat_interval_ms:
         env_int("DEVPULSE_HEARTBEAT_INTERVAL_MS", @default_heartbeat_interval_ms),
@@ -85,12 +85,12 @@ defmodule DevpulseAgent.Config do
     end
   end
 
-  def save_workspace_config!(workspace_root, attrs) when is_map(attrs) do
-    case save_workspace_config(workspace_root, attrs) do
-      {:ok, _path} -> :ok
-      {:error, reason} -> raise "failed to save workspace config: #{inspect(reason)}"
-    end
-  end
+  # def save_workspace_config!(workspace_root, attrs) when is_map(attrs) do
+  #   case save_workspace_config(workspace_root, attrs) do
+  #     {:ok, _path} -> :ok
+  #     {:error, reason} -> raise "failed to save workspace config: #{inspect(reason)}"
+  #   end
+  # end
 
   def save_workspace_config(workspace_root, attrs) when is_map(attrs) do
     with :ok <- ensure_workspace_dir(workspace_root) do
@@ -256,7 +256,7 @@ defmodule DevpulseAgent.Config do
   defp encode_config(config) do
     top_level_keys = [
       :server_url,
-      :master_api_token,
+      :token,
       :default_team,
       :heartbeat_interval_ms,
       :offline_retention_ms,
@@ -384,7 +384,7 @@ defmodule DevpulseAgent.Config do
   defp key_to_atom(key) do
     case String.trim(key) do
       "server_url" -> :server_url
-      "master_api_token" -> :master_api_token
+      "token" -> :token
       "default_team" -> :default_team
       "heartbeat_interval_ms" -> :heartbeat_interval_ms
       "offline_retention_ms" -> :offline_retention_ms

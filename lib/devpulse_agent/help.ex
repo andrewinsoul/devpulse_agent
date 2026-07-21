@@ -1,20 +1,6 @@
 defmodule DevpulseAgent.Help do
   def show_help_info(cmd) do
     %{
-      "team link" => """
-      NAME
-        devpulse team link
-
-      DESCRIPTION
-        Links the specified team slug to your current active workspace. This establishes
-        a local environment reference mapping the team configuration to the underlying Git repository.
-
-      USAGE
-        devpulse team link <team_slug>
-
-      OPTIONS
-        -w, --workspace <dir>  Explicitly target a workspace directory (Defaults to the current working directory)
-      """,
       "config get" => """
       NAME
         devpulse config get
@@ -27,7 +13,7 @@ defmodule DevpulseAgent.Help do
         devpulse config get [key]
 
       VALID KEYS
-        server_url, master_api_token, default_team, heartbeat_interval_ms, offline_retention_ms, log_level
+        server_url, token, default_team, heartbeat_interval_ms, offline_retention_ms, log_level
 
       OPTIONS
         -s, --server <url>     Override the server target for this query execution context
@@ -45,23 +31,37 @@ defmodule DevpulseAgent.Help do
         devpulse config set <key> <value>
 
       VALID KEYS
-        server_url, master_api_token, default_team, heartbeat_interval_ms, offline_retention_ms, log_level
+        server_url, token, default_team, heartbeat_interval_ms, offline_retention_ms, log_level
       """,
       "login" => """
       NAME
         devpulse login
 
       DESCRIPTION
-        Authenticates this machine with the DevPulse server. Resolves the team targets,
-        verifies Git metadata hooks, and executes a handshake to obtain an operational telemetry session token.
+        Authenticates this machine globally with the DevPulse server using an invitation token.
+        Exchanges the invitation token for a permanent Personal Access Token (PAT) and
+        securely persists it to the global system configuration file.
 
       USAGE
-        devpulse login
+        devpulse login --token <invite_token>
 
       OPTIONS
-        -s, --server <url>     Target a custom metrics ingestion server URL
-        -t, --token <token>    Specify the master API authorization token directly
-        -w, --workspace <dir>  Specify the target workspace root directory path
+        -t, --token <token>    [REQUIRED] Specify the unique team invitation token string
+      """,
+      "init" => """
+      NAME
+        devpulse init
+
+      DESCRIPTION
+        Initializes a local project repository for DevPulse tracking. Uses the global
+        machine token to fetch available teams and projects, links the current Git directory,
+        and creates a tracking configuration context for the workspace.
+
+      USAGE
+        devpulse init
+
+      OPTIONS
+        -w, --workspace <dir>  Explicitly target a workspace directory (Defaults to current working directory)
       """,
       "whoami" => """
       NAME
@@ -134,8 +134,8 @@ defmodule DevpulseAgent.Help do
       devpulse <command> [options]
 
     Commands:
-      init           Initialize a new local configuration file
-      login          Authenticate this machine and start a session
+      init           Set up repository tracking context for a workspace
+      login          Authenticate this machine globally using an invite token
       whoami         Show current developer and session identity
       start          Start active telemetry monitoring for this workspace
       stop           Stop background monitoring on this runtime
@@ -143,9 +143,6 @@ defmodule DevpulseAgent.Help do
 
       config get     Display current configuration keys
       config set     Update configuration attributes
-
-      team link      Link current workspace to an engineering team
-      team select    Link workspace to a team (alias path)
 
       help           Show this help message
 

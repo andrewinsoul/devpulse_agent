@@ -5,10 +5,18 @@ defmodule DevpulseAgent.CLI do
 
   require Logger
 
-  alias DevpulseAgent.Utils.{Suggestion, Formatter}
+  alias DevpulseAgent.Utils.{Suggestion, Formatter, Prompt}
   alias DevpulseAgent.{Agent, Buffer, Client, Config, Git, Session, Workspace, Help}
 
   def main(args) do
+    case Dotenvy.source([".env", System.get_env()]) do
+      {:ok, env} ->
+        System.put_env(env)
+
+      {:error, reason} ->
+        IO.warn("Failed to load .env: #{inspect(reason)}")
+    end
+
     Application.ensure_all_started(:devpulse_agent)
 
     case dispatch(args) do
@@ -30,8 +38,7 @@ defmodule DevpulseAgent.CLI do
       "whoami",
       "config get",
       "config set",
-      "team link",
-      "team unlink",
+      "init",
       "team list"
     ]
 
@@ -49,7 +56,9 @@ defmodule DevpulseAgent.CLI do
       ["config", "set"] ->
         run_config_set(rest)
 
-      # ["init"] -> run_init(rest)
+      ["init"] ->
+        run_init(rest)
+
       ["help"] ->
         run_help(rest)
 
@@ -231,7 +240,7 @@ defmodule DevpulseAgent.CLI do
 
       [command | rest]
       when command in [
-             #  "init",
+             "init",
              "login",
              "whoami",
              "status",
@@ -247,15 +256,64 @@ defmodule DevpulseAgent.CLI do
     end
   end
 
-  # defp run_init(args) do
-  #   {opts, _, _} =
-  #     OptionParser.parse(args, switches: common_switches(), aliases: common_aliases())
+  defp run_init(args) do
+    {opts, _, _} =
+      OptionParser.parse(args, switches: common_switches(), aliases: common_aliases())
 
-  #   config = Config.load() |> merge_cli_overrides(opts)
-  #   Config.save!(config)
-  #   IO.puts("DevPulse configuration initialized at #{Config.config_file()}")
-  #   :ok
-  # end
+    workspace_path = Keyword.get(opts, :workspace) || File.cwd!()
+
+    config = Config.load()
+    token = Map.get(config, :token)
+
+    IO.inspect(token, label: ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> MMM ")
+
+    if is_nil(token) do
+      IO.puts(:stderr, "❌ Error: Not authenticated. Run `devpulse login --token <token>` first.")
+      System.halt(1)
+    end
+
+    base_url = System.get_env("api_base_url", "http://localhost:4000/api/v1")
+    IO.puts("Fetching authorized team channels...")
+    teams = Client.get_teams(base_url, token)
+    IO.inspect(teams, label: "TEAMS >>>>>>>>>>>>>>>>> ")
+
+    if teams != [] do
+      team_names = Enum.map(teams, & &1["name"])
+      selected_name = Prompt.select("Choose an engineering team:", team_names)
+      selected_team = Enum.find(teams, &(&1["name"] == selected_name))
+      team_slug = selected_team["slug"]
+
+      IO.puts("Fetching projects under team [#{team_slug}]...")
+
+      projects = Client.get_projects(base_url, token, team_slug)
+      IO.inspect(projects, label: "PROJECTS >>>>>>>>>>>>>>>>>>> ")
+      project_names = Enum.map(projects, & &1["name"])
+      selected_proj_name = Prompt.select("Select the project repository to bind:", project_names)
+      selected_project = Enum.find(projects, &(&1["name"] == selected_proj_name))
+
+      remote_url =
+        case Git.remote_url(workspace_path) do
+          {:ok, url} -> url
+          _ -> nil
+        end
+
+      new_mapping = %{
+        path: workspace_path,
+        team_slug: team_slug,
+        project_slug: selected_project["slug"],
+        remote_url: remote_url
+      }
+
+      updated_mappings = [new_mapping | Map.get(config, :workspace_mappings, [])]
+      updated_config = Map.put(config, :workspace_mappings, updated_mappings)
+
+      Config.save!(updated_config)
+
+      IO.puts("🎉 Workspace initialized successfully!")
+      IO.puts("Linked project: #{selected_project["name"]} (#{team_slug})")
+      IO.puts("Path tracking ready: #{workspace_path}")
+    end
+  end
 
   defp run_help([]), do: IO.puts(Help.show_generic_help_info())
 
@@ -269,19 +327,106 @@ defmodule DevpulseAgent.CLI do
     end
   end
 
+  defp open_browser(url) do
+    cmd =
+      case :os.type() do
+        {:unix, :darwin} -> "open"
+        {:unix, _} -> "xdg-open"
+        {:win32, _} -> "start"
+      end
+
+    System.cmd(cmd, [url])
+  rescue
+    _ -> :ok
+  end
+
+  defp await_authorization(base_url, pairing_code, retries \\ 60)
+
+  defp await_authorization(_base_url, _pairing_code, 0) do
+    {:error, "Authorization timed out. Please try logging in again."}
+  end
+
+  defp await_authorization(base_url, pairing_code, retries) do
+    Process.sleep(2_000)
+
+    case Client.check_pairing_status(base_url, pairing_code) do
+      {:ok, %{"status" => "approved"} = config} ->
+        {:ok, config}
+
+      {:ok, %{"status" => "pending"}} ->
+        await_authorization(base_url, pairing_code, retries - 1)
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        await_authorization(base_url, pairing_code, retries - 1)
+    end
+  end
+
   defp run_login(args) do
     {opts, _, _} =
       OptionParser.parse(args, switches: common_switches(), aliases: common_aliases())
 
-    workspace = workspace_root(opts)
-    config = Config.load() |> merge_cli_overrides(opts)
+    invite_token = Keyword.get(opts, :token)
 
-    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config),
-         :ok <- persist_team_link(workspace, team_slug),
-         {:ok, config} <-
-           perform_handshake(config, workspace, team_slug) do
-      Config.save!(config)
-      IO.puts("You have successfully logged in...")
+    if is_nil(invite_token) do
+      IO.puts(:stderr, "Error: Missing invite token. Usage: devpulse login --token <your_token>")
+      System.halt(1)
+    end
+
+    case authenticate_machine(invite_token) |> IO.inspect(label: "---- NATURE ------") do
+      {:ok, config} ->
+        Config.save!(config)
+
+        IO.puts(
+          "🎉 You have successfully logged in globally! Run `devpulse init` inside a repository to connect your project."
+        )
+
+      {:ok, :retrigger, %{"verification_url" => url, "pairing_code" => code}} ->
+        base_url =
+          System.get_env("api_base_url", "http://localhost:4000/api/v1")
+
+        IO.puts("""
+
+        \e[33m\e[1m⚠️  Token Expired\e[0m
+        -------------------------------------------------------------
+        Your invite token has expired or is no longer valid.
+
+        To re-authenticate, open the link below in your browser:
+        \e[36m\e[4m#{url}\e[0m
+
+        Waiting for browser authorization...
+        """)
+
+        open_browser(url)
+
+        case await_authorization(base_url, code) do
+          {:ok, %{"token" => token} = config} ->
+            config_to_save =
+              config
+              |> Map.delete("token")
+              |> Map.put(:token, token)
+
+            Config.save!(config_to_save)
+
+            IO.puts("""
+
+            \e[32m\e[1m🎉 Successfully re-authenticated!\e[0m
+            Run `devpulse init` inside a repository to connect your project.
+            """)
+
+          {:error, reason} ->
+            IO.puts(:stderr, "\n❌ Re-authentication failed: #{reason}")
+            System.halt(1)
+        end
+
+      {:error, reason} ->
+        IO.puts(:stderr, "❌ Login failed: #{reason}")
+        System.halt(1)
+
+      _ ->
+        IO.puts(:stderr, "❌ Login failed: An error occured during login...")
     end
   end
 
@@ -507,61 +652,64 @@ defmodule DevpulseAgent.CLI do
     end
   end
 
-  defp perform_handshake(config, workspace, team_slug) do
-    if is_nil(team_slug) do
-      {:error, :team_required}
+  defp authenticate_machine(invite_token) do
+    if is_nil(invite_token) do
+      {:error, "token is required, pass the invite token using the token flag"}
     else
-      with {:ok, repo_metadata} <- Git.metadata(workspace),
-           {:ok, session} <- handshake(config, team_slug, repo_metadata) do
-        Session.save!(session)
-        IO.puts("Handshake succeeded for team #{team_slug}")
-        IO.puts("Session expires at #{format_datetime(session.expires_at)}")
-        {:ok, config}
-      else
-        {:error, :missing_master_api_token} ->
-          {:error, :missing_master_api_token}
+      base_url =
+        System.get_env("api_base_url", "http://localhost:4000/api/v1")
 
-        {:error, reason} ->
-          {:error, reason}
+      case Client.exchange_invite(base_url, invite_token) do
+        {:ok, %{"status" => "success", "token" => pat}} ->
+          {:ok, %{token: pat}}
+
+        {:error, {reason, _body}} when reason in [:unauthorized, :not_found] ->
+          Client.retrigger_auth(base_url, invite_token)
+
+        {:error, {:transport_error, reason}} ->
+          {:error, "Network connection failed: #{inspect(reason)}"}
+
+        {:error, {:http_error, status, %{"error" => message}}} ->
+          {:error, "Server error (#{status}): #{message}"}
+
+        _error ->
+          {:error, "An unexpected error occurred while communicating with the server."}
       end
     end
   end
 
-  defp handshake(config, team_slug, repo_metadata) do
-    token = config.master_api_token
-
-    if is_nil(token) or token == "" do
-      {:error, :missing_master_api_token}
-    else
-      hostname = hostname()
-      operating_system = operating_system()
-      fingerprint = hardware_fingerprint(hostname, operating_system, repo_metadata.repo_path)
-
-      Client.handshake(config.server_url, token, %{
-        team_slug: team_slug,
-        hostname: hostname,
-        operating_system: operating_system,
-        hardware_fingerprint: fingerprint,
-        project_name: repo_metadata.project_name,
-        repo_path: repo_metadata.repo_path,
-        git_remote_url: repo_metadata.remote_url
-      })
-      |> case do
-        {:ok, body} ->
-          {:ok,
-           Session.from_handshake_response(body, %{
-             team_slug: team_slug,
-             hostname: hostname,
-             operating_system: operating_system,
-             hardware_fingerprint: fingerprint,
-             server_url: config.server_url
-           })}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
-    end
-  end
+  # defp handshake(config, team_slug, repo_metadata) do
+  #   token = config.master_api_token
+  #   if is_nil(token) or token == "" do
+  #     {:error, :missing_master_api_token}
+  #   else
+  #     hostname = hostname()
+  #     operating_system = operating_system()
+  #     fingerprint = hardware_fingerprint(hostname, operating_system, repo_metadata.repo_path)
+  #     Client.handshake(config.server_url, token, %{
+  #       team_slug: team_slug,
+  #       hostname: hostname,
+  #       operating_system: operating_system,
+  #       hardware_fingerprint: fingerprint,
+  #       project_name: repo_metadata.project_name,
+  #       repo_path: repo_metadata.repo_path,
+  #       git_remote_url: repo_metadata.remote_url
+  #     })
+  #     |> case do
+  #       {:ok, body} ->
+  #         {:ok,
+  #          Session.from_handshake_response(body, %{
+  #            team_slug: team_slug,
+  #            hostname: hostname,
+  #            operating_system: operating_system,
+  #            hardware_fingerprint: fingerprint,
+  #            server_url: config.server_url
+  #          })}
+  #       {:error, reason} ->
+  #         {:error, reason}
+  #     end
+  #   end
+  # end
 
   defp startable_config(config, team_slug) do
     cond do
@@ -633,7 +781,6 @@ defmodule DevpulseAgent.CLI do
   #   IO.puts("Offline retention   :  #{status.offline_retention_ms}ms")
   #   IO.puts("Log level           :  #{status.log_level}")
   # end
-
   # defp format_config(config) do
   #   rows = [
   #     {"Server URL", config.server_url},
@@ -643,25 +790,24 @@ defmodule DevpulseAgent.CLI do
   #     {"Offline Retention", "#{config.offline_retention_ms} ms"},
   #     {"Log Level", config.log_level}
   #   ]
-
   #   width =
   #     rows
   #     |> Enum.map(fn {label, _} -> String.length(label) end)
   #     |> Enum.max()
-
+  #
   #   body =
   #     Enum.map_join(rows, "\n", fn {label, value} ->
   #       "#{String.pad_trailing(label, width)} : #{value}"
   #     end)
-
+  #
   #   """
   #   DevPulse Configuration
   #   #{String.duplicate("-", 60)}
-
+  #
   #   #{body}
   #   """
   # end
-
+  #
   # defp present(nil), do: "<not configured>"
   # defp present(""), do: "<not configured>"
   # defp present(value), do: to_string(value)
@@ -676,17 +822,6 @@ defmodule DevpulseAgent.CLI do
   defp format_datetime(nil), do: "unknown"
   defp format_datetime(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
   defp format_datetime(value) when is_binary(value), do: value
-
-  # defp bool_text(true), do: "yes"
-  # defp bool_text(false), do: "no"
-  # defp bool_text(nil), do: "no"
-
-  # defp masked(nil), do: ""
-
-  # defp masked(token) when is_binary(token) and byte_size(token) > 8,
-  #   do: String.slice(token, 0, 4) <> "..."
-
-  # defp masked(token), do: token
 
   defp format_reason({:not_git_repo, workspace}), do: "#{workspace} is not a git repository"
   defp format_reason(:team_required), do: "workspace team selection is required"
@@ -711,8 +846,8 @@ defmodule DevpulseAgent.CLI do
   defp boot_banner(workspace, team_slug) do
     logo = ~S"""
                ____              ____        __
-      /\      / __ \___ _   __  / __ \__  __/ /____ ___      /\
-    _/  \/\_ / / / / _ \ | / / / /_/ / / / / / ___/ _ \    _/  \/\_
+      /\      / __ \___ _   __  / __ \__  __/ /____ ___       /\
+    _/  \/\_ / / / / _ \ | / / / /_/ / / / / / ___/ _ \    __/  \/\_
             / /_/ /  __/ |/ / / ____/ /_/ / (__  )  __/
            /_____/\___/|___/ /_/    \__,_/_/____/\___/...
     """
@@ -723,24 +858,6 @@ defmodule DevpulseAgent.CLI do
     IO.puts("")
     IO.puts("🟢 DevPulse Agent started")
     IO.puts("⏳ Press Ctrl+C to stop")
-  end
-
-  defp hostname do
-    with {:ok, host} <- :inet.gethostname() do
-      to_string(host)
-    else
-      _ -> "unknown-host"
-    end
-  end
-
-  defp operating_system do
-    {family, name} = :os.type()
-    "#{family}/#{name}"
-  end
-
-  defp hardware_fingerprint(hostname, operating_system, repo_path) do
-    :crypto.hash(:sha256, Enum.join([hostname, operating_system, repo_path], "|"))
-    |> Base.encode16(case: :lower)
   end
 
   defp persist_team_link(workspace, team_slug) do
