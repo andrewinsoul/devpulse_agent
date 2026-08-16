@@ -24,3 +24,6 @@ devpulse_agent-*.tar
 
 .env
 
+native/terminal/target/
+
+/priv/native/

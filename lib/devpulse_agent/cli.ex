@@ -258,61 +258,118 @@ defmodule DevpulseAgent.CLI do
 
   defp run_init(args) do
     {opts, _, _} =
-      OptionParser.parse(args, switches: common_switches(), aliases: common_aliases())
+      OptionParser.parse(args,
+        switches: common_switches(),
+        aliases: common_aliases()
+      )
 
     workspace_path = Keyword.get(opts, :workspace) || File.cwd!()
 
     config = Config.load()
     token = Map.get(config, :token)
 
-    IO.inspect(token, label: ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> MMM ")
-
     if is_nil(token) do
-      IO.puts(:stderr, "❌ Error: Not authenticated. Run `devpulse login --token <token>` first.")
+      IO.puts(
+        :stderr,
+        "❌ Error: Not authenticated. Run `devpulse login --token <invite_token>` first."
+      )
+
+      System.halt(1)
+    end
+
+    team_info = config[:team] || config["team"] || %{}
+    team_slug = config[:default_team] || team_info[:slug] || team_info["slug"]
+
+    if is_nil(team_slug) or team_slug == "" do
+      IO.puts(:stderr, "❌ Error: No associated team found in config. Please re-authenticate.")
       System.halt(1)
     end
 
     base_url = System.get_env("api_base_url", "http://localhost:4000/api/v1")
-    IO.puts("Fetching authorized team channels...")
-    teams = Client.get_teams(base_url, token)
-    IO.inspect(teams, label: "TEAMS >>>>>>>>>>>>>>>>> ")
 
-    if teams != [] do
-      team_names = Enum.map(teams, & &1["name"])
-      selected_name = Prompt.select("Choose an engineering team:", team_names)
-      selected_team = Enum.find(teams, &(&1["name"] == selected_name))
-      team_slug = selected_team["slug"]
+    projects = Client.get_projects(base_url, token, team_slug)
 
-      IO.puts("Fetching projects under team [#{team_slug}]...")
-
-      projects = Client.get_projects(base_url, token, team_slug)
-      IO.inspect(projects, label: "PROJECTS >>>>>>>>>>>>>>>>>>> ")
-      project_names = Enum.map(projects, & &1["name"])
-      selected_proj_name = Prompt.select("Select the project repository to bind:", project_names)
-      selected_project = Enum.find(projects, &(&1["name"] == selected_proj_name))
-
-      remote_url =
-        case Git.remote_url(workspace_path) do
-          {:ok, url} -> url
-          _ -> nil
-        end
-
-      new_mapping = %{
-        path: workspace_path,
-        team_slug: team_slug,
-        project_slug: selected_project["slug"],
-        remote_url: remote_url
-      }
-
-      updated_mappings = [new_mapping | Map.get(config, :workspace_mappings, [])]
-      updated_config = Map.put(config, :workspace_mappings, updated_mappings)
-
-      Config.save!(updated_config)
-
-      IO.puts("🎉 Workspace initialized successfully!")
-      IO.puts("Linked project: #{selected_project["name"]} (#{team_slug})")
-      IO.puts("Path tracking ready: #{workspace_path}")
+    if projects == [] do
+      IO.puts(:stderr, "❌ No repositories found for team: #{team_slug}")
+      System.halt(1)
     end
+
+    project_names = Enum.map(projects, & &1["name"])
+
+    selected_project_name =
+      Prompt.select(
+        "Select a repository",
+        project_names
+      )
+
+    selected_project = Enum.find(projects, &(&1["name"] == selected_project_name))
+
+    remote_url =
+      case Git.remote_url(workspace_path) do
+        nil -> nil
+        url -> url
+      end
+
+    team_data = %{
+      "id" => team_info[:id] || team_info["id"],
+      "name" => team_info[:name] || team_info["name"] || team_slug,
+      "slug" => team_slug
+    }
+
+    project_data = %{
+      "id" => selected_project["id"],
+      "name" => selected_project["name"],
+      "slug" => selected_project["slug"]
+    }
+
+    Config.save_workspace_config(workspace_path, %{
+      workspace_path: Path.expand(workspace_path),
+      remote_url: remote_url,
+      team: team_data,
+      project: project_data
+    })
+
+    new_workspace_mapping = %{
+      path: Path.expand(workspace_path),
+      team_slug: team_slug,
+      project_slug: selected_project["slug"],
+      remote_url: remote_url
+    }
+
+    team_with_projects = Map.put(team_data, "projects", [project_data])
+
+    existing_teams = Map.get(config, :team_mappings, [])
+
+    updated_teams =
+      Enum.reject(existing_teams, fn t -> (t[:slug] || t["slug"]) == team_slug end) ++
+        [team_with_projects]
+
+    updated_mappings =
+      Enum.reject(Map.get(config, :workspace_mappings, []), fn m ->
+        m.path == Path.expand(workspace_path)
+      end) ++ [new_workspace_mapping]
+
+    updated_config =
+      config
+      |> Map.put(:team_mappings, updated_teams)
+      |> Map.put(:workspace_mappings, updated_mappings)
+
+    Config.save!(updated_config)
+
+    IO.puts("")
+    IO.puts("────────────────────────────────────────────")
+    IO.puts("")
+    IO.puts(IO.ANSI.green() <> "✓ Workspace initialized" <> IO.ANSI.reset())
+    IO.puts("")
+    IO.puts("  Team        #{team_data["name"]}")
+    IO.puts("  Repository  #{selected_project["name"]}")
+    IO.puts("  Directory   #{workspace_path}")
+
+    if remote_url do
+      IO.puts("  Remote      #{remote_url}")
+    end
+
+    IO.puts("")
   end
 
   defp run_help([]), do: IO.puts(Help.show_generic_help_info())
@@ -375,12 +432,18 @@ defmodule DevpulseAgent.CLI do
       System.halt(1)
     end
 
-    case authenticate_machine(invite_token) |> IO.inspect(label: "---- NATURE ------") do
-      {:ok, config} ->
-        Config.save!(config)
+    case authenticate_machine(invite_token) do
+      {:ok, %{token: token, team: team}} ->
+        current_config = Config.load()
+
+        current_config
+        |> Map.put(:token, token)
+        |> Map.put(:team, team)
+        |> Map.put(:default_team, team["slug"] || team[:slug])
+        |> Config.save!()
 
         IO.puts(
-          "🎉 You have successfully logged in globally! Run `devpulse init` inside a repository to connect your project."
+          "🎉 You have successfully logged in globally for team '#{team["name"]}'! Run `devpulse init` inside a repository to connect your project."
         )
 
       {:ok, :retrigger, %{"verification_url" => url, "pairing_code" => code}} ->
@@ -402,11 +465,13 @@ defmodule DevpulseAgent.CLI do
         open_browser(url)
 
         case await_authorization(base_url, code) do
-          {:ok, %{"token" => token} = config} ->
+          {:ok, %{"token" => token, "team" => team} = config} ->
             config_to_save =
               config
               |> Map.delete("token")
               |> Map.put(:token, token)
+              |> Map.delete("team")
+              |> Map.put(:team, team)
 
             Config.save!(config_to_save)
 
@@ -603,8 +668,7 @@ defmodule DevpulseAgent.CLI do
     workspace = workspace_root(opts)
     config = Config.load() |> merge_cli_overrides(opts)
 
-    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config),
-         :ok <- persist_team_link(workspace, team_slug) do
+    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config) do
       case startable_config(config, team_slug) do
         :ok ->
           boot_banner(workspace, team_slug)
@@ -660,8 +724,8 @@ defmodule DevpulseAgent.CLI do
         System.get_env("api_base_url", "http://localhost:4000/api/v1")
 
       case Client.exchange_invite(base_url, invite_token) do
-        {:ok, %{"status" => "success", "token" => pat}} ->
-          {:ok, %{token: pat}}
+        {:ok, %{"status" => "success", "token" => pat, "team" => team}} ->
+          {:ok, %{token: pat, team: team}}
 
         {:error, {reason, _body}} when reason in [:unauthorized, :not_found] ->
           Client.retrigger_auth(base_url, invite_token)
@@ -860,14 +924,13 @@ defmodule DevpulseAgent.CLI do
     IO.puts("⏳ Press Ctrl+C to stop")
   end
 
-  defp persist_team_link(workspace, team_slug) do
-    remote_url = Git.remote_url(workspace)
-
-    case Workspace.link_team(workspace, team_slug, remote_url) do
-      {:ok, _status, _path} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
-  end
+  # defp persist_team_link(workspace, team_slug) do
+  #   remote_url = Git.remote_url(workspace)
+  #   case Workspace.link_team(workspace, team_slug, remote_url) do
+  #     {:ok, _status, _path} -> :ok
+  #     {:error, reason} -> {:error, reason}
+  #   end
+  # end
 
   defp config_key_atom(key) do
     case String.trim(key) do

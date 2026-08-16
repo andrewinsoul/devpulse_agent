@@ -65,6 +65,7 @@ mix test
 mix run -e 'DevpulseAgent.CLI.main(["config","get"])'
 mix run -e 'DevpulseAgent.CLI.main(["config","set","default_team","core"])'
 mix run -e 'DevpulseAgent.CLI.main(["config","get","default_team"])'
+mix run -e 'DevpulseAgent.CLI.main(["init", "--workspace", "/tmp/devpulse-playground"])'
 ```
 
 What to learn here:

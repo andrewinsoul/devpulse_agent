@@ -73,20 +73,26 @@ defmodule DevpulseAgent.Client do
   Fetches all teams that the authenticated developer has access to.
   """
   def get_teams(base_url, token) do
-    request(base_url, "/cli/teams", token, :personal_access_token, :get)
+    case request(base_url, "/cli/teams", token, :personal_access_token, :get) do
+      {:ok, %{"status" => "success", "teams" => teams}} -> teams
+      error -> error
+    end
   end
 
   @doc """
   Fetches all projects under a specific team scope.
   """
   def get_projects(base_url, token, team_id) do
-    request(
-      base_url,
-      "/cli/teams/#{team_id}/projects",
-      token,
-      :personal_access_token,
-      :get
-    )
+    case request(
+           base_url,
+           "/cli/teams/#{team_id}/projects",
+           token,
+           :personal_access_token,
+           :get
+         ) do
+      {:ok, %{"status" => "success", "projects" => projects}} -> projects
+      error -> error
+    end
   end
 
   @doc """

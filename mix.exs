@@ -35,7 +35,8 @@ defmodule DevpulseAgent.MixProject do
       {:dotenvy, "~> 0.8.0"},
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
-      {:burrito, "~> 1.0"}
+      {:burrito, "~> 1.0"},
+      {:rustler, "~> 0.37"}
     ]
   end
 end

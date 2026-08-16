@@ -15,12 +15,14 @@ defmodule DevpulseAgent.Config do
       server_url: System.get_env("api_base_url", "http://localhost:4000"),
       token: empty_to_nil(System.get_env("DEVPULSE_TOKEN")),
       default_team: empty_to_nil(System.get_env("DEVPULSE_TEAM")),
+      team: %{},
       heartbeat_interval_ms:
         env_int("DEVPULSE_HEARTBEAT_INTERVAL_MS", @default_heartbeat_interval_ms),
       offline_retention_ms:
         env_int("DEVPULSE_OFFLINE_RETENTION_MS", @default_offline_retention_ms),
       log_level: System.get_env("DEVPULSE_LOG_LEVEL", "info"),
-      workspace_mappings: []
+      workspace_mappings: [],
+      team_mappings: []
     }
   end
 
@@ -75,6 +77,37 @@ defmodule DevpulseAgent.Config do
     load() |> Map.get(key)
   end
 
+  def ensure_gitignored(workspace_root) do
+    gitignore_path = Path.join(workspace_root, ".gitignore")
+
+    ignore_entries = [
+      ".devpulse.toml",
+      ".devpulse/"
+    ]
+
+    if File.exists?(gitignore_path) do
+      content = File.read!(gitignore_path)
+
+      missing_entries =
+        Enum.reject(ignore_entries, fn entry ->
+          String.contains?(content, entry)
+        end)
+
+      unless Enum.empty?(missing_entries) do
+        appendix =
+          "\n# DevPulse local configuration\n" <> Enum.join(missing_entries, "\n") <> "\n"
+
+        File.write!(gitignore_path, content <> appendix)
+      end
+    else
+      # Create .gitignore if none exists in the directory
+      content = "# DevPulse local configuration\n" <> Enum.join(ignore_entries, "\n") <> "\n"
+      File.write!(gitignore_path, content)
+    end
+
+    :ok
+  end
+
   def load_workspace_config(workspace_root) do
     file = workspace_config_file(workspace_root)
 
@@ -96,11 +129,17 @@ defmodule DevpulseAgent.Config do
     with :ok <- ensure_workspace_dir(workspace_root) do
       file = workspace_config_file(workspace_root)
       current = load_workspace_config(workspace_root)
-      updated = Map.merge(current, Map.take(attrs, [:team_slug, :remote_url, :workspace_path]))
+
+      updated =
+        current
+        |> Map.merge(Map.take(attrs, [:workspace_path, :remote_url]))
+        |> Map.put(:team, attrs[:team] || %{})
+        |> Map.put(:project, attrs[:project] || %{})
 
       case File.write(file, encode_workspace_config(updated)) do
         :ok ->
           secure_file!(file)
+          ensure_gitignored(workspace_root)
           {:ok, file}
 
         {:error, reason} ->
@@ -254,6 +293,8 @@ defmodule DevpulseAgent.Config do
   end
 
   defp encode_config(config) do
+    team = config[:team] || config["team"] || %{}
+
     top_level_keys = [
       :server_url,
       :token,
@@ -272,41 +313,60 @@ defmodule DevpulseAgent.Config do
         end
       end)
 
+    # Encode user's authenticated team block
+    team_block =
+      if team != %{} do
+        [
+          "",
+          "[[team]]",
+          "id = #{encode_value(team[:id] || team["id"])}",
+          "name = #{encode_value(team[:name] || team["name"])}",
+          "slug = #{encode_value(team[:slug] || team["slug"])}"
+        ]
+      else
+        []
+      end
+
     workspace_blocks =
-      config.workspace_mappings
+      (config[:workspace_mappings] || [])
       |> Enum.flat_map(fn mapping ->
         [
           "",
           "[[workspace]]",
-          "path = #{encode_value(mapping.path)}",
-          "team_slug = #{encode_value(mapping.team_slug)}"
+          "path = #{encode_value(mapping[:path] || mapping["path"])}"
         ] ++
-          case mapping.remote_url do
+          case mapping[:project_slug] || mapping["project_slug"] do
             nil -> []
-            remote_url -> ["remote_url = #{encode_value(remote_url)}"]
+            slug -> ["project_slug = #{encode_value(slug)}"]
           end
       end)
 
-    ([top_level] ++ [workspace_blocks])
+    ([top_level] ++ [team_block] ++ [workspace_blocks])
     |> List.flatten()
     |> Enum.join("\n")
     |> Kernel.<>("\n")
   end
 
   defp encode_workspace_config(config) do
-    lines =
-      []
-      |> maybe_add_kv("team_slug", config[:team_slug])
-      |> maybe_add_kv("remote_url", config[:remote_url])
-      |> maybe_add_kv("workspace_path", config[:workspace_path] || config[:path])
+    team = config[:team] || config["team"] || %{}
+    project = config[:project] || config["project"] || %{}
+
+    lines = [
+      "workspace_path = #{encode_value(config[:workspace_path] || config["workspace_path"])}",
+      "remote_url = #{encode_value(config[:remote_url] || config["remote_url"])}",
+      "",
+      "[[team]]",
+      "id = #{encode_value(team[:id] || team["id"])}",
+      "name = #{encode_value(team[:name] || team["name"])}",
+      "slug = #{encode_value(team[:slug] || team["slug"])}",
+      "",
+      "  [[team.project]]",
+      "  id = #{encode_value(project[:id] || project["id"])}",
+      "  name = #{encode_value(project[:name] || project["name"])}",
+      "  slug = #{encode_value(project[:slug] || project["slug"])}"
+    ]
 
     Enum.join(lines, "\n") <> "\n"
-  end
-
-  defp maybe_add_kv(lines, _key, nil), do: lines
-
-  defp maybe_add_kv(lines, key, value) do
-    lines ++ ["#{key} = #{encode_value(value)}"]
   end
 
   defp parse_assignment(line) do
@@ -356,6 +416,9 @@ defmodule DevpulseAgent.Config do
       :workspace_mappings, left, right ->
         normalize_workspace_mappings(List.wrap(left) ++ List.wrap(right))
 
+      :team_mappings, left, right ->
+        normalize_team_mappings(List.wrap(left) ++ List.wrap(right))
+
       _key, nil, default ->
         default
 
@@ -364,6 +427,8 @@ defmodule DevpulseAgent.Config do
     end)
     |> Map.put_new(:workspace_mappings, [])
     |> Map.update!(:workspace_mappings, &normalize_workspace_mappings/1)
+    |> Map.put_new(:team_mappings, [])
+    |> Map.update!(:team_mappings, &normalize_team_mappings/1)
   end
 
   defp normalize_workspace_mappings(entries) when is_list(entries) do
@@ -373,11 +438,26 @@ defmodule DevpulseAgent.Config do
     |> Enum.map(&normalize_workspace_mapping/1)
   end
 
+  defp normalize_team_mappings(entries) when is_list(entries) do
+    entries
+    |> List.wrap()
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&normalize_team_mapping/1)
+  end
+
   defp normalize_workspace_mapping(mapping) when is_map(mapping) do
     %{
       path: mapping[:path] || mapping["path"],
       team_slug: mapping[:team_slug] || mapping["team_slug"],
       remote_url: mapping[:remote_url] || mapping["remote_url"]
+    }
+  end
+
+  defp normalize_team_mapping(mapping) when is_map(mapping) do
+    %{
+      team_id: mapping[:team_id] || mapping["team_id"],
+      team_slug: mapping[:team_slug] || mapping["team_slug"],
+      name: mapping[:name] || mapping["name"]
     }
   end
 
@@ -389,7 +469,14 @@ defmodule DevpulseAgent.Config do
       "heartbeat_interval_ms" -> :heartbeat_interval_ms
       "offline_retention_ms" -> :offline_retention_ms
       "log_level" -> :log_level
+      "project_slug" -> :project_slug
+      "project_id" -> :project_id
       "team_slug" -> :team_slug
+      "team_id" -> :team_id
+      "team" -> :team
+      "name" -> :name
+      "slug" -> :slug
+      "id" -> :id
       "remote_url" -> :remote_url
       "path" -> :path
       "workspace_path" -> :workspace_path

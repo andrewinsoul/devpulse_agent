@@ -58,47 +58,42 @@ defmodule DevpulseAgent.Workspace do
     end
   end
 
-  def link_team(workspace_root, team_slug, remote_url \\ nil) do
-    with {:ok, _repo_metadata} <- Git.metadata(workspace_root) do
-      current_config = Config.load_workspace_config(workspace_root)
-      current_team = local_team(current_config)
-      resolved_remote_url = remote_url || current_remote_url(current_config)
-
-      cond do
-        is_nil(current_team) ->
-          with {:ok, path} <-
-                 Config.save_workspace_config(workspace_root, %{
-                   team_slug: team_slug,
-                   remote_url: resolved_remote_url,
-                   workspace_path: Path.expand(workspace_root)
-                 }),
-               :ok <- Git.ensure_git_exclude(workspace_root),
-               :ok <- Config.put_workspace_mapping(workspace_root, team_slug, resolved_remote_url) do
-            {:ok, :linked, path}
-          end
-
-        current_team == team_slug ->
-          {:ok, :already_linked, Config.workspace_config_file(workspace_root)}
-
-        true ->
-          {:error, {:workspace_team_conflict, current_team, team_slug}}
-      end
-    else
-      {:error, :not_git_repo} ->
-        {:error, {:not_git_repo, workspace_root}}
-    end
-  end
-
-  def select_team(workspace_root, team_slug, remote_url \\ nil) do
-    link_team(workspace_root, team_slug, remote_url)
-  end
-
-  def select_team!(workspace_root, team_slug, remote_url \\ nil) do
-    case link_team(workspace_root, team_slug, remote_url) do
-      {:ok, _status, _path} -> :ok
-      {:error, reason} -> raise "failed to link team: #{inspect(reason)}"
-    end
-  end
+  # def link_team(workspace_root, team_slug, remote_url \\ nil) do
+  #   with {:ok, _repo_metadata} <- Git.metadata(workspace_root) do
+  #     current_config = Config.load_workspace_config(workspace_root)
+  #     current_team = local_team(current_config)
+  #     resolved_remote_url = remote_url || current_remote_url(current_config)
+  #     cond do
+  #       is_nil(current_team) ->
+  #         with {:ok, path} <-
+  #                Config.save_workspace_config(workspace_root, %{
+  #                  team_slug: team_slug,
+  #                  remote_url: resolved_remote_url,
+  #                  workspace_path: Path.expand(workspace_root)
+  #                }),
+  #              :ok <- Git.ensure_git_exclude(workspace_root),
+  #              :ok <- Config.put_workspace_mapping(workspace_root, team_slug, resolved_remote_url) do
+  #           {:ok, :linked, path}
+  #         end
+  #       current_team == team_slug ->
+  #         {:ok, :already_linked, Config.workspace_config_file(workspace_root)}
+  #       true ->
+  #         {:error, {:workspace_team_conflict, current_team, team_slug}}
+  #     end
+  #   else
+  #     {:error, :not_git_repo} ->
+  #       {:error, {:not_git_repo, workspace_root}}
+  #   end
+  # end
+  # def select_team(workspace_root, team_slug, remote_url \\ nil) do
+  #   link_team(workspace_root, team_slug, remote_url)
+  # end
+  # def select_team!(workspace_root, team_slug, remote_url \\ nil) do
+  #   case link_team(workspace_root, team_slug, remote_url) do
+  #     {:ok, _status, _path} -> :ok
+  #     {:error, reason} -> raise "failed to link team: #{inspect(reason)}"
+  #   end
+  # end
 
   def workspace_mapping_summary(workspace_root) do
     local_config = Config.load_workspace_config(workspace_root)
@@ -114,9 +109,9 @@ defmodule DevpulseAgent.Workspace do
     config[:team_slug] || config["team_slug"]
   end
 
-  defp current_remote_url(config) do
-    config[:remote_url] || config["remote_url"]
-  end
+  # defp current_remote_url(config) do
+  #   config[:remote_url] || config["remote_url"]
+  # end
 
   defp default_team(config) do
     case config.default_team do

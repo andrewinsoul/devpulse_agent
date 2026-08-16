@@ -8,96 +8,66 @@ defmodule DevpulseAgent.Utils.Prompt do
     • Enter  - Select
   """
 
+  alias DevpulseAgent.Utils.Terminal
+
   @spec select(String.t(), [String.t()]) :: String.t()
-  def select(_label, []), do: raise(ArgumentError, "Prompt requires at least one item")
+  def select(_label, []),
+    do: raise(ArgumentError, "Prompt requires at least one item")
 
   def select(label, items) do
-    count = length(items)
+    Terminal.with_raw_mode(fn ->
+      IO.puts(IO.ANSI.bright() <> label <> IO.ANSI.reset())
+      IO.write("\n")
 
-    IO.puts("\n")
-    IO.puts("#{IO.ANSI.cyan()}?#{IO.ANSI.reset()} #{IO.ANSI.bright()}#{label}#{IO.ANSI.reset()}")
-
-    enable_raw_mode()
-
-    try do
-      index = loop(items, count, 0)
-      IO.puts("\n")
-      Enum.at(items, index)
-    after
-      disable_raw_mode()
-    end
-  end
-
-  defp loop(items, count, current_idx, first_render? \\ true)
-
-  defp loop(items, count, current_idx, first_render?) do
-    render(items, count, current_idx, first_render?)
-
-    case read_key() do
-      :up ->
-        loop(items, count, max(current_idx - 1, 0), false)
-
-      :down ->
-        loop(items, count, min(current_idx + 1, count - 1), false)
-
-      :enter ->
-        unless first_render? do
-          IO.write(IO.ANSI.cursor_up(count) <> "\e[J")
-        end
-
-        current_idx
-
-      _ ->
-        loop(items, count, current_idx, false)
-    end
-  end
-
-  defp render(items, count, current_idx, first_render?) do
-    unless first_render? do
-      IO.write(IO.ANSI.cursor_up(count) <> "\e[J")
-    end
-
-    Enum.with_index(items)
-    |> Enum.each(fn {item, idx} ->
-      if idx == current_idx do
-        IO.puts("  #{IO.ANSI.cyan()}➔ #{item}#{IO.ANSI.reset()}")
-      else
-        IO.puts("    #{item}")
-      end
+      render_items(items, 0)
+      loop(items, 0)
     end)
   end
 
-  defp enable_raw_mode do
-    System.cmd("stty", ["raw", "-echo"])
-  end
+  defp loop(items, selected) do
+    case Terminal.read_key() do
+      "ctrl_c" ->
+        System.halt(130)
 
-  defp disable_raw_mode do
-    System.cmd("stty", ["-raw", "echo"])
-  end
+      "up" ->
+        redraw(items, max(selected - 1, 0))
 
-  defp read_key do
-    case IO.binread(:stdio, 1) do
-      "\e" ->
-        case IO.binread(:stdio, 2) do
-          "[A" -> :up
-          "[B" -> :down
-          _ -> :unknown
-        end
+      "down" ->
+        redraw(items, min(selected + 1, length(items) - 1))
 
-      "k" ->
-        :up
+      {"char", "k"} ->
+        redraw(items, max(selected - 1, 0))
 
-      "j" ->
-        :down
+      {"char", "j"} ->
+        redraw(items, min(selected + 1, length(items) - 1))
 
-      "\r" ->
-        :enter
-
-      "\n" ->
-        :enter
+      "enter" ->
+        Enum.at(items, selected)
 
       _ ->
-        :unknown
+        loop(items, selected)
     end
+  end
+
+  defp redraw(items, selected) do
+    {:ok, _} = Terminal.move_up(length(items))
+    render_items(items, selected)
+    loop(items, selected)
+  end
+
+  defp render_items(items, selected) do
+    Enum.with_index(items)
+    |> Enum.each(fn {item, index} ->
+      IO.write(IO.ANSI.clear_line())
+      IO.write("\r")
+
+      if index == selected do
+        IO.write(IO.ANSI.green() <> "❯ " <> item <> IO.ANSI.reset())
+      else
+        IO.write("  " <> item)
+      end
+
+      IO.write("\n")
+    end)
   end
 end
