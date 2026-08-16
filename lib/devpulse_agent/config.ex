@@ -250,42 +250,64 @@ defmodule DevpulseAgent.Config do
 
   def parse_integer(value) when is_integer(value), do: value
 
+  defp maybe_push_workspace(workspaces, nil), do: workspaces
+  defp maybe_push_workspace(workspaces, %{} = workspace), do: [workspace | workspaces]
+
   defp parse_config(content) do
-    {root, workspace_entries} =
+    {root, team, workspace_entries} =
       content
       |> String.split("\n")
-      |> Enum.reduce({%{}, [], nil}, fn raw_line, {root, workspaces, current_workspace} ->
+      |> Enum.reduce({%{}, %{}, [], :root, nil}, fn raw_line,
+                                                    {root, team, workspaces, section, current_ws} ->
         line = String.trim(raw_line)
 
         cond do
           line == "" or String.starts_with?(line, "#") ->
-            {root, workspaces, current_workspace}
+            {root, team, workspaces, section, current_ws}
+
+          line == "[[team]]" or line == "[team]" ->
+            workspaces = maybe_push_workspace(workspaces, current_ws)
+            {root, team, workspaces, :team, nil}
 
           line == "[[workspace]]" ->
-            workspaces = maybe_push_workspace(workspaces, current_workspace)
-            {root, workspaces, %{}}
+            workspaces = maybe_push_workspace(workspaces, current_ws)
+            {root, team, workspaces, :workspace, %{}}
 
           String.starts_with?(line, "[") and String.ends_with?(line, "]") ->
-            {root, maybe_push_workspace(workspaces, current_workspace), nil}
+            workspaces = maybe_push_workspace(workspaces, current_ws)
+            {root, team, workspaces, :other, nil}
 
           String.contains?(line, "=") ->
             {key, value} = parse_assignment(line)
             parsed_value = parse_value(value)
+            atom_key = key_to_atom(key)
 
-            case current_workspace do
-              nil -> {Map.put(root, key_to_atom(key), parsed_value), workspaces, nil}
-              workspace -> {root, workspaces, Map.put(workspace, key_to_atom(key), parsed_value)}
+            case section do
+              :root ->
+                {Map.put(root, atom_key, parsed_value), team, workspaces, section, nil}
+
+              :team ->
+                updated_team = Map.put(team, atom_key, parsed_value)
+                {root, updated_team, workspaces, section, nil}
+
+              :workspace ->
+                updated_ws = Map.put(current_ws || %{}, atom_key, parsed_value)
+                {root, team, workspaces, section, updated_ws}
+
+              _ ->
+                {root, team, workspaces, section, nil}
             end
 
           true ->
-            {root, workspaces, current_workspace}
+            {root, team, workspaces, section, current_ws}
         end
       end)
-      |> then(fn {root, workspaces, current_workspace} ->
-        {root, maybe_push_workspace(workspaces, current_workspace)}
+      |> then(fn {root, team, workspaces, _section, current_ws} ->
+        {root, team, maybe_push_workspace(workspaces, current_ws)}
       end)
 
     root
+    |> Map.put(:team, team)
     |> Map.merge(%{
       workspace_mappings: Enum.map(workspace_entries, &normalize_workspace_mapping/1)
     })
@@ -347,23 +369,21 @@ defmodule DevpulseAgent.Config do
     |> Kernel.<>("\n")
   end
 
+  # Glory
   defp encode_workspace_config(config) do
     team = config[:team] || config["team"] || %{}
     project = config[:project] || config["project"] || %{}
 
     lines = [
       "workspace_path = #{encode_value(config[:workspace_path] || config["workspace_path"])}",
-      "remote_url = #{encode_value(config[:remote_url] || config["remote_url"])}",
       "",
-      "[[team]]",
-      "id = #{encode_value(team[:id] || team["id"])}",
-      "name = #{encode_value(team[:name] || team["name"])}",
-      "slug = #{encode_value(team[:slug] || team["slug"])}",
+      "team_id = #{encode_value(team[:id] || team["id"])}",
+      "team_name = #{encode_value(team[:name] || team["name"])}",
+      "team_slug = #{encode_value(team[:slug] || team["slug"])}",
       "",
-      "  [[team.project]]",
-      "  id = #{encode_value(project[:id] || project["id"])}",
-      "  name = #{encode_value(project[:name] || project["name"])}",
-      "  slug = #{encode_value(project[:slug] || project["slug"])}"
+      "project_id = #{encode_value(project[:id] || project["id"])}",
+      "project_name = #{encode_value(project[:name] || project["name"])}",
+      "project_remote_url = #{encode_value(project[:git_remote_url] || project["git_remote_url"])}"
     ]
 
     Enum.join(lines, "\n") <> "\n"
@@ -483,9 +503,6 @@ defmodule DevpulseAgent.Config do
       other -> String.to_atom(other)
     end
   end
-
-  defp maybe_push_workspace(workspaces, nil), do: workspaces
-  defp maybe_push_workspace(workspaces, %{} = workspace), do: [workspace | workspaces]
 
   defp ensure_config_dir! do
     File.mkdir_p!(config_dir())

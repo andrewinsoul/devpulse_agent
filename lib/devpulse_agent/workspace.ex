@@ -13,48 +13,65 @@ defmodule DevpulseAgent.Workspace do
     end
   end
 
-  def resolve_team(workspace_root, opts \\ [], config \\ Config.load()) do
+  def resolve_team(workspace_root, repo_metadata, opts \\ [], config \\ Config.load()) do
     explicit_team = Keyword.get(opts, :team)
-    local_config = Config.load_workspace_config(workspace_root)
 
-    with {:ok, repo_metadata} <- Git.metadata(workspace_root) do
-      if is_binary(explicit_team) and explicit_team != "" do
-        case local_team(local_config) do
-          nil ->
-            {:ok, explicit_team, :explicit}
+    local_config =
+      Config.load_workspace_config(workspace_root)
 
-          ^explicit_team ->
-            {:ok, explicit_team, :explicit}
+    if is_binary(explicit_team) and explicit_team != "" do
+      case local_team(local_config) do
+        nil ->
+          {:ok, explicit_team, :explicit}
 
-          existing_team ->
-            {:error, {:workspace_team_conflict, existing_team, explicit_team}}
-        end
-      else
-        candidates =
-          [
-            local_team(local_config) && {:local_config, local_team(local_config)},
-            path_mapped_team(workspace_root, config),
-            remote_mapped_team({:ok, repo_metadata}, config)
-          ]
-          |> Enum.reject(&is_nil/1)
+        ^explicit_team ->
+          {:ok, explicit_team, :explicit}
 
-        case unique_team_choice(candidates) do
-          {:ok, team_slug, source} ->
-            {:ok, team_slug, source}
-
-          {:error, :team_required} ->
-            case default_team(config) do
-              nil -> {:error, :team_required}
-              {:default_config, team_slug} -> {:ok, team_slug, :default_config}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        existing_team ->
+          {:error, {:workspace_team_conflict, existing_team, explicit_team}}
       end
     else
-      {:error, :not_git_repo} ->
-        {:error, {:not_git_repo, workspace_root}}
+      candidates =
+        [
+          local_team(local_config) && {:local_config, local_team(local_config)},
+          path_mapped_team(workspace_root, config),
+          remote_mapped_team({:ok, repo_metadata}, config)
+        ]
+        |> Enum.reject(&is_nil/1)
+
+      case unique_team_choice(candidates) do
+        {:ok, team_slug, source} ->
+          {:ok, team_slug, source}
+
+        {:error, :team_required} ->
+          case default_team(config) do
+            nil -> {:error, :team_required}
+            {:default_config, team_slug} -> {:ok, team_slug, :default_config}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def resolve_project(workspace_root) do
+    local_config =
+      Config.load_workspace_config(workspace_root)
+
+    case local_config do
+      %{
+        project_id: project_id,
+        project_name: project_name
+      } ->
+        {:ok,
+         %{
+           project_id: project_id,
+           project_name: project_name
+         }}
+
+      _ ->
+        {:error, "project info not found, reinitialize the project..."}
     end
   end
 

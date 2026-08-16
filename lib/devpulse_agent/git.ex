@@ -17,33 +17,43 @@ defmodule DevpulseAgent.Git do
   end
 
   def ensure_git_exclude(workspace_root, pattern \\ ".devpulse.toml") do
-    exclude_file =
-      Path.join([workspace_root, ".git", "info", "exclude"])
+    with {:ok, _root} <- repo_root(workspace_root) do
+      exclude_file =
+        Path.join([workspace_root, ".git", "info", "exclude"])
 
-    with :ok <- File.mkdir_p(Path.dirname(exclude_file)) do
-      contents =
-        case File.read(exclude_file) do
-          {:ok, data} -> data
-          {:error, :enoent} -> ""
-          {:error, reason} -> return_error(reason)
+      with :ok <- File.mkdir_p(Path.dirname(exclude_file)) do
+        contents =
+          case File.read(exclude_file) do
+            {:ok, data} ->
+              data
+
+            {:error, :enoent} ->
+              ""
+
+            {:error, reason} ->
+              return_error(reason)
+          end
+
+        entries =
+          contents
+          |> String.split("\n", trim: true)
+
+        unless pattern in entries do
+          new_contents =
+            contents
+            |> String.trim_trailing()
+            |> Kernel.<>("\n")
+            |> Kernel.<>(pattern)
+            |> Kernel.<>("\n")
+
+          File.write!(exclude_file, new_contents)
         end
 
-      entries =
-        contents
-        |> String.split("\n", trim: true)
-
-      unless pattern in entries do
-        new_contents =
-          contents
-          |> String.trim_trailing()
-          |> Kernel.<>("\n")
-          |> Kernel.<>(pattern)
-          |> Kernel.<>("\n")
-
-        File.write!(exclude_file, new_contents)
+        :ok
       end
-
-      :ok
+    else
+      {:error, :not_git_repo} ->
+        {:error, :not_git_repo}
     end
   end
 

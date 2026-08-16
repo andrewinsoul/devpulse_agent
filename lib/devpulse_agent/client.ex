@@ -101,7 +101,7 @@ defmodule DevpulseAgent.Client do
   def handshake(base_url, token, attrs) do
     request(
       base_url,
-      "/api/agent/handshake",
+      "/cli/agent/handshake",
       token,
       handshake_payload(attrs),
       :personal_access_token,
@@ -119,13 +119,13 @@ defmodule DevpulseAgent.Client do
   @doc """
   Streams telemetry state payloads back to the ingestion loops.
   """
-  def heartbeat(base_url, session_token, attrs) do
+  def heartbeat(base_url, token, attrs) do
     request(
       base_url,
-      "/api/agent/heartbeat",
-      session_token,
+      "/cli/agent/heartbeats",
+      token,
       heartbeat_payload(attrs),
-      :session,
+      :personal_access_token,
       :post
     )
   end
@@ -203,14 +203,10 @@ defmodule DevpulseAgent.Client do
 
   defp handshake_payload(attrs) do
     %{
-      team_slug: attrs[:team_slug],
-      project_slug: attrs[:project_slug],
-      hostname: attrs[:hostname],
-      operating_system: attrs[:operating_system],
+      project_id: attrs[:project_id],
       hardware_fingerprint: attrs[:hardware_fingerprint],
-      project_name: attrs[:project_name],
-      repo_path: attrs[:repo_path],
-      git_remote_url: attrs[:git_remote_url]
+      hostname: attrs[:hostname],
+      operating_system: attrs[:operating_system]
     }
     |> drop_nils()
   end

@@ -32,7 +32,6 @@ defmodule DevpulseAgent.CLI do
       "login",
       "start",
       "stop",
-      "logout",
       "status",
       "doctor",
       "whoami",
@@ -43,9 +42,6 @@ defmodule DevpulseAgent.CLI do
     ]
 
     case command do
-      ["team", "link"] ->
-        run_team_link(rest)
-
       ["team", "list"] ->
         run_ls_team(rest)
 
@@ -81,9 +77,9 @@ defmodule DevpulseAgent.CLI do
         run_stop(rest)
 
       [] ->
-        input = Enum.join(args, " ")
+        input = List.first(args)
 
-        case Suggestion.suggest(input, commands) do
+        case Suggestion.suggest(input || "", commands) do
           {:ok, suggestion} ->
             IO.puts("""
             Unknown command: #{input}
@@ -142,8 +138,8 @@ defmodule DevpulseAgent.CLI do
     git_repo? = git_repository?(workspace)
 
     workspace_linked? =
-      case Workspace.resolve_team(workspace, opts, config) do
-        {:ok, _, _} -> true
+      case resolve_team_choice(workspace, opts, config) do
+        {:ok, _team_slug} -> true
         _ -> false
       end
 
@@ -266,6 +262,7 @@ defmodule DevpulseAgent.CLI do
     workspace_path = Keyword.get(opts, :workspace) || File.cwd!()
 
     config = Config.load()
+
     token = Map.get(config, :token)
 
     if is_nil(token) do
@@ -278,16 +275,20 @@ defmodule DevpulseAgent.CLI do
     end
 
     team_info = config[:team] || config["team"] || %{}
-    team_slug = config[:default_team] || team_info[:slug] || team_info["slug"]
 
-    if is_nil(team_slug) or team_slug == "" do
+    team_id = team_info[:id] || team_info["id"]
+
+    team_slug =
+      config[:default_team] || team_info[:slug] || team_info["slug"]
+
+    if is_nil(team_id) or team_id == "" do
       IO.puts(:stderr, "❌ Error: No associated team found in config. Please re-authenticate.")
       System.halt(1)
     end
 
     base_url = System.get_env("api_base_url", "http://localhost:4000/api/v1")
 
-    projects = Client.get_projects(base_url, token, team_slug)
+    projects = Client.get_projects(base_url, token, team_id)
 
     if projects == [] do
       IO.puts(:stderr, "❌ No repositories found for team: #{team_slug}")
@@ -304,12 +305,6 @@ defmodule DevpulseAgent.CLI do
 
     selected_project = Enum.find(projects, &(&1["name"] == selected_project_name))
 
-    remote_url =
-      case Git.remote_url(workspace_path) do
-        nil -> nil
-        url -> url
-      end
-
     team_data = %{
       "id" => team_info[:id] || team_info["id"],
       "name" => team_info[:name] || team_info["name"] || team_slug,
@@ -319,12 +314,11 @@ defmodule DevpulseAgent.CLI do
     project_data = %{
       "id" => selected_project["id"],
       "name" => selected_project["name"],
-      "slug" => selected_project["slug"]
+      "git_remote_url" => selected_project["remote_url"]
     }
 
     Config.save_workspace_config(workspace_path, %{
       workspace_path: Path.expand(workspace_path),
-      remote_url: remote_url,
       team: team_data,
       project: project_data
     })
@@ -333,7 +327,7 @@ defmodule DevpulseAgent.CLI do
       path: Path.expand(workspace_path),
       team_slug: team_slug,
       project_slug: selected_project["slug"],
-      remote_url: remote_url
+      remote_url: selected_project["git_remote_url"]
     }
 
     team_with_projects = Map.put(team_data, "projects", [project_data])
@@ -361,13 +355,11 @@ defmodule DevpulseAgent.CLI do
     IO.puts("")
     IO.puts(IO.ANSI.green() <> "✓ Workspace initialized" <> IO.ANSI.reset())
     IO.puts("")
-    IO.puts("  Team        #{team_data["name"]}")
-    IO.puts("  Repository  #{selected_project["name"]}")
-    IO.puts("  Directory   #{workspace_path}")
 
-    if remote_url do
-      IO.puts("  Remote      #{remote_url}")
-    end
+    Formatter.print_table(
+      headers: ["TEAM", "PROJECT", "LOCAL DIR."],
+      rows: [[team_data["name"], selected_project["name"], workspace_path]]
+    )
 
     IO.puts("")
   end
@@ -495,32 +487,27 @@ defmodule DevpulseAgent.CLI do
     end
   end
 
-  defp run_team_link(args) do
-    {opts, positional, _} =
-      OptionParser.parse(args, switches: [workspace: :string], aliases: [w: :workspace])
-
-    case positional do
-      [team_slug] ->
-        workspace = Path.expand(Keyword.get(opts, :workspace, File.cwd!()))
-        remote_url = Git.remote_url(workspace)
-
-        case Workspace.link_team(workspace, team_slug, remote_url) do
-          {:ok, :linked, _path} ->
-            IO.puts("Linked team #{team_slug} to #{workspace}")
-            :ok
-
-          {:ok, :already_linked, _path} ->
-            IO.puts("Workspace #{workspace} is already linked to team #{team_slug}")
-            :ok
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      _ ->
-        {:error, :team_link_requires_a_team_slug}
-    end
-  end
+  # defp run_team_link(args) do
+  #   {opts, positional, _} =
+  #     OptionParser.parse(args, switches: [workspace: :string], aliases: [w: :workspace])
+  #   case positional do
+  #     [team_slug] ->
+  #       workspace = Path.expand(Keyword.get(opts, :workspace, File.cwd!()))
+  #       remote_url = Git.remote_url(workspace)
+  #       case Workspace.link_team(workspace, team_slug, remote_url) do
+  #         {:ok, :linked, _path} ->
+  #           IO.puts("Linked team #{team_slug} to #{workspace}")
+  #           :ok
+  #         {:ok, :already_linked, _path} ->
+  #           IO.puts("Workspace #{workspace} is already linked to team #{team_slug}")
+  #           :ok
+  #         {:error, reason} ->
+  #           {:error, reason}
+  #       end
+  #     _ ->
+  #       {:error, :team_link_requires_a_team_slug}
+  #   end
+  # end
 
   defp run_whoami(args) do
     {opts, _, _} =
@@ -666,9 +653,14 @@ defmodule DevpulseAgent.CLI do
       )
 
     workspace = workspace_root(opts)
-    config = Config.load() |> merge_cli_overrides(opts)
 
-    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config) do
+    config =
+      Config.load()
+      |> merge_cli_overrides(opts)
+
+    with {:ok, repo_metadata} <- Git.metadata(workspace),
+         {:ok, team_slug} <-
+           resolve_team_choice(workspace, repo_metadata, opts, config) do
       case startable_config(config, team_slug) do
         :ok ->
           boot_banner(workspace, team_slug)
@@ -780,7 +772,7 @@ defmodule DevpulseAgent.CLI do
       is_nil(team_slug) or team_slug == "" ->
         {:error, :team_required}
 
-      is_nil(config.master_api_token) or config.master_api_token == "" ->
+      is_nil(config.token) or config.token == "" ->
         {:error, :missing_master_api_token}
 
       true ->
@@ -789,9 +781,30 @@ defmodule DevpulseAgent.CLI do
   end
 
   defp resolve_team_choice(workspace, opts, config) do
-    case Workspace.resolve_team(workspace, [team: Keyword.get(opts, :team)], config) do
-      {:ok, team_slug, _source} -> {:ok, team_slug}
-      {:error, reason} -> {:error, reason}
+    with {:ok, repo_metadata} <- Git.metadata(workspace),
+         {:ok, team_slug, _source} <-
+           Workspace.resolve_team(
+             workspace,
+             repo_metadata,
+             [team: Keyword.get(opts, :team)],
+             config
+           ) do
+      {:ok, team_slug}
+    end
+  end
+
+  defp resolve_team_choice(workspace, repo_metadata, opts, config) do
+    case Workspace.resolve_team(
+           workspace,
+           repo_metadata,
+           [team: Keyword.get(opts, :team)],
+           config
+         ) do
+      {:ok, team_slug, _source} ->
+        {:ok, team_slug}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -801,7 +814,7 @@ defmodule DevpulseAgent.CLI do
   defp merge_cli_overrides(config, opts) do
     config
     |> maybe_put(:server_url, Keyword.get(opts, :server))
-    |> maybe_put(:master_api_token, Keyword.get(opts, :token))
+    |> maybe_put(:token, Keyword.get(opts, :token))
     |> maybe_put(:heartbeat_interval_ms, Keyword.get(opts, :heartbeat_interval_ms))
     |> maybe_put(:offline_retention_ms, Keyword.get(opts, :offline_retention_ms))
     |> maybe_put(:log_level, Keyword.get(opts, :log_level))
@@ -832,49 +845,6 @@ defmodule DevpulseAgent.CLI do
     IO.puts(:stderr, "Error: #{format_reason(reason)}")
     {:error, reason}
   end
-
-  # defp print_status(status) do
-  #   IO.puts("Status for Workspace\n#{String.duplicate("-", 60)}")
-  #   IO.puts("Server              :  #{status.server_url}")
-  #   IO.puts("Workspace           :  #{status.workspace}")
-  #   IO.puts("Team                :  #{status.team_slug || "unassigned"}")
-  #   IO.puts("Session active      :  #{bool_text(status.session_active)}")
-  #   IO.puts("Session expires     :  #{format_datetime(status.session_expires_at)}")
-  #   IO.puts("Buffered heartbeats :  #{status.buffered_heartbeats}")
-  #   IO.puts("Heartbeat interval  :  #{status.heartbeat_interval_ms}ms")
-  #   IO.puts("Offline retention   :  #{status.offline_retention_ms}ms")
-  #   IO.puts("Log level           :  #{status.log_level}")
-  # end
-  # defp format_config(config) do
-  #   rows = [
-  #     {"Server URL", config.server_url},
-  #     {"Master API Token", masked(config.master_api_token)},
-  #     {"Default Team", present(config.default_team)},
-  #     {"Heartbeat Interval", "#{config.heartbeat_interval_ms} ms"},
-  #     {"Offline Retention", "#{config.offline_retention_ms} ms"},
-  #     {"Log Level", config.log_level}
-  #   ]
-  #   width =
-  #     rows
-  #     |> Enum.map(fn {label, _} -> String.length(label) end)
-  #     |> Enum.max()
-  #
-  #   body =
-  #     Enum.map_join(rows, "\n", fn {label, value} ->
-  #       "#{String.pad_trailing(label, width)} : #{value}"
-  #     end)
-  #
-  #   """
-  #   DevPulse Configuration
-  #   #{String.duplicate("-", 60)}
-  #
-  #   #{body}
-  #   """
-  # end
-  #
-  # defp present(nil), do: "<not configured>"
-  # defp present(""), do: "<not configured>"
-  # defp present(value), do: to_string(value)
 
   defp format_value(nil), do: ""
   defp format_value(value), do: to_string(value)
@@ -936,6 +906,7 @@ defmodule DevpulseAgent.CLI do
     case String.trim(key) do
       "server_url" -> :server_url
       "master_api_token" -> :master_api_token
+      "token" -> :token
       "default_team" -> :default_team
       "heartbeat_interval_ms" -> :heartbeat_interval_ms
       "offline_retention_ms" -> :offline_retention_ms

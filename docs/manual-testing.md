@@ -1,5 +1,12 @@
 # Manual Testing Guide
 
+# NOTE
+
+I am getting rid of every team linking from the CLI, those are done by the team lead from the web side. On the CLI, devs  
+just need to use the link that their lead gives them which contains information of the team and the project —— the devs just need to link their local project to the project contained in the invite link via the init command.
+
+---
+
 This project is a good place to learn Elixir because the flow is small and easy to trace:
 
 - `CLI` receives commands
@@ -17,6 +24,8 @@ Run commands from the folder that contains `mix.exs`:
 ```bash
 cd /Users/nature/Documents/elixir_projcets/dev_pulse/devpulse_agent
 ```
+
+
 
 ## 2. Use a temporary HOME
 
@@ -64,7 +73,7 @@ Go back to the Elixir project folder, then try these one by one:
 mix test
 mix run -e 'DevpulseAgent.CLI.main(["config","get"])'
 mix run -e 'DevpulseAgent.CLI.main(["config","set","default_team","core"])'
-mix run -e 'DevpulseAgent.CLI.main(["config","get","default_team"])'
+mix run -e 'DevpulseAgent.CLI.main(["config","get","default_team"])'init
 mix run -e 'DevpulseAgent.CLI.main(["init", "--workspace", "/tmp/devpulse-playground"])'
 ```
 
@@ -76,7 +85,7 @@ What to learn here:
 
 
 
-## 5. Test workspace lookup
+## 5. Test workspace lookup — Refactor
 
 Now ask the CLI to inspect the scratch repo:
 
@@ -92,7 +101,7 @@ What to learn here:
 
 
 
-## 6. Test team linking
+## 6. Test team linking — Ignore
 
 This writes a workspace-local file:
 
@@ -117,7 +126,7 @@ What to learn here:
 `start` is the background loop. It is the best command to inspect with logs, but run it only after the smaller commands are working:
 
 ```bash
-mix run -e 'DevpulseAgent.CLI.main(["start","--workspace","/tmp/devpulse-playground","--team","core"])'
+mix run -e 'DevpulseAgent.CLI.main(["start","--workspace","/tmp/devpulse-playground"])'
 ```
 
 What to watch for:
@@ -145,6 +154,16 @@ Ideally, this one is done on the browser and as soon as the developer is done, h
 
 ```bash
 They click the link on the mail and a form with mail prepopulated and disabled is displayed
+```
+
+
+
+## 10. Start heart beat, after successfully authenticating, start sending heart beats on pulse to devpulse_server
+
+1. Start heartbeat to server by calling this endpoint
+
+```
+mix run -e 'DevpulseAgent.CLI.main(["start", "--workspace", "/tmp/devpulse-playground"])'
 ```
 
 

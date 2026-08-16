@@ -32,26 +32,30 @@ defmodule DevpulseAgent.Agent do
     git = Keyword.get(opts, :git, Git)
 
     with {:ok, repo_metadata} <- git.metadata(workspace_root),
-         {:ok, team_slug, team_source} <- Workspace.resolve_team(workspace_root, opts, config) do
-      session = Session.load()
-
+         {:ok, team_slug, team_source} <-
+           Workspace.resolve_team(workspace_root, repo_metadata, opts, config),
+         {:ok, project_info} <- Workspace.resolve_project(workspace_root) do
       state = %{
         workspace_root: workspace_root,
         repo_metadata: repo_metadata,
         team_slug: team_slug,
+        project_id: project_info[:project_id],
+        project_name: project_info[:project_name],
         team_source: team_source,
         config: config,
         client: client,
         git: git,
-        session: session,
+        session: nil,
         supervisor: Keyword.get(opts, :supervisor),
         offline: false,
         backoff_ms: config.heartbeat_interval_ms,
-        force_handshake?: Keyword.get(opts, :force_handshake, false)
+        force_handshake?: true
       }
 
-      Logger.info("DevPulse agent ready for team #{team_slug}")
+      IO.puts("DevPulse agent ready for team #{team_slug}")
+
       send(self(), :tick)
+
       {:ok, state}
     else
       {:error, :not_git_repo} ->
@@ -64,6 +68,7 @@ defmodule DevpulseAgent.Agent do
 
       {:error, {:ambiguous_team, teams}} ->
         Logger.error("DevPulse workspace maps to multiple teams: #{Enum.join(teams, ", ")}")
+
         {:stop, {:ambiguous_team, teams}}
     end
   end
@@ -91,9 +96,14 @@ defmodule DevpulseAgent.Agent do
 
   defp send_heartbeat_cycle(state) do
     repo_metadata = refresh_repo_metadata(state)
+
     heartbeat_event = heartbeat_event(state, repo_metadata)
+
     retention_ms = state.config.offline_retention_ms
-    buffered_events = Buffer.load() |> Buffer.prune(retention_ms)
+
+    buffered_events =
+      Buffer.load()
+      |> Buffer.prune(retention_ms)
 
     case flush_buffer(buffered_events, state) do
       {:ok, remaining_events, updated_state} ->
@@ -102,11 +112,21 @@ defmodule DevpulseAgent.Agent do
             finalize_success(final_state, remaining_events)
 
           {:error, reason, failed_state} ->
-            handle_cycle_error(failed_state, reason, heartbeat_event, remaining_events)
+            handle_cycle_error(
+              failed_state,
+              reason,
+              heartbeat_event,
+              remaining_events
+            )
         end
 
       {:error, reason, remaining_events, failed_state} ->
-        handle_cycle_error(failed_state, reason, heartbeat_event, remaining_events)
+        handle_cycle_error(
+          failed_state,
+          reason,
+          heartbeat_event,
+          remaining_events
+        )
     end
   end
 
@@ -117,7 +137,7 @@ defmodule DevpulseAgent.Agent do
       Buffer.replace!(remaining_events)
     end
 
-    Logger.info("Heartbeat flowing for team #{state.team_slug}")
+    Logger.debug("Heartbeat flowing for team #{state.team_slug}")
 
     next_state = %{
       state
@@ -131,19 +151,38 @@ defmodule DevpulseAgent.Agent do
 
   defp buffer_failure(heartbeat_event, remaining_events, state, reason) do
     Buffer.replace!(remaining_events ++ [heartbeat_event])
+
     Logger.warning("Heartbeat buffered because #{format_reason(reason)}")
 
     next_backoff =
-      min(max(state.backoff_ms * 2, state.config.heartbeat_interval_ms), @max_backoff_ms)
+      min(
+        max(state.backoff_ms * 2, state.config.heartbeat_interval_ms),
+        @max_backoff_ms
+      )
 
-    schedule_next_tick(%{state | offline: true, backoff_ms: next_backoff})
+    schedule_next_tick(%{
+      state
+      | offline: true,
+        backoff_ms: next_backoff
+    })
   end
 
-  defp handle_cycle_error(state, reason, heartbeat_event, remaining_events) do
+  defp handle_cycle_error(
+         state,
+         reason,
+         heartbeat_event,
+         remaining_events
+       ) do
     if retryable_error?(reason) do
-      buffer_failure(heartbeat_event, remaining_events, state, reason)
+      buffer_failure(
+        heartbeat_event,
+        remaining_events,
+        state,
+        reason
+      )
     else
       Logger.error("Heartbeat stopped because #{format_reason(reason)}")
+
       fatal_shutdown(state, reason)
     end
   end
@@ -153,11 +192,19 @@ defmodule DevpulseAgent.Agent do
       Logger.error("Session unavailable: #{format_reason(reason)}")
 
       next_backoff =
-        min(max(state.backoff_ms * 2, state.config.heartbeat_interval_ms), @max_backoff_ms)
+        min(
+          max(state.backoff_ms * 2, state.config.heartbeat_interval_ms),
+          @max_backoff_ms
+        )
 
-      schedule_next_tick(%{state | offline: true, backoff_ms: next_backoff})
+      schedule_next_tick(%{
+        state
+        | offline: true,
+          backoff_ms: next_backoff
+      })
     else
       Logger.error("Session stopped because #{format_reason(reason)}")
+
       fatal_shutdown(state, reason)
     end
   end
@@ -168,8 +215,11 @@ defmodule DevpulseAgent.Agent do
     case send_event(state, event) do
       {:ok, new_state} ->
         case flush_buffer(rest, new_state) do
-          {:ok, remaining, final_state} -> {:ok, remaining, final_state}
-          {:error, reason, remaining, final_state} -> {:error, reason, remaining, final_state}
+          {:ok, remaining, final_state} ->
+            {:ok, remaining, final_state}
+
+          {:error, reason, remaining, final_state} ->
+            {:error, reason, remaining, final_state}
         end
 
       {:error, reason, new_state} ->
@@ -177,10 +227,16 @@ defmodule DevpulseAgent.Agent do
     end
   end
 
-  defp send_event(state, event), do: send_event(state, event, false)
+  defp send_event(state, event) do
+    send_event(state, event, false)
+  end
 
   defp send_event(state, event, retried_handshake?) do
-    case state.client.heartbeat(state.config.server_url, state.session.session_token, event) do
+    case state.client.heartbeat(
+           state.config.server_url,
+           state.config.token,
+           event
+         ) do
       {:ok, _response} ->
         {:ok, state}
 
@@ -201,44 +257,67 @@ defmodule DevpulseAgent.Agent do
     end
   end
 
-  defp ensure_session(%{force_handshake?: true} = state), do: handshake(state)
+  defp ensure_session(%{force_handshake?: true} = state) do
+    handshake(state)
+  end
 
   defp ensure_session(%{session: %Session{} = session} = state) do
-    if not Session.expired?(session) and
-         not Session.expiring_soon?(session) and
-         session.team_slug == state.team_slug and
-         session.server_url == state.config.server_url do
-      {:ok, state}
-    else
+    if Session.expired?(session) do
       handshake(state)
+    else
+      {:ok, state}
     end
   end
 
-  defp ensure_session(state), do: handshake(state)
+  defp ensure_session(state) do
+    handshake(state)
+  end
 
   defp handshake(state) do
-    token = state.config.master_api_token
+    token = state.config.token
 
     if is_nil(token) or token == "" do
       {:error, :missing_master_api_token, state}
     else
       context = handshake_context(state)
 
-      case state.client.handshake(state.config.server_url, token, context) do
-        {:ok, body} ->
-          session = Session.from_handshake_response(body, context)
+      case state.client.handshake(
+             state.config.server_url,
+             token,
+             context
+           ) do
+        {:ok, %{"session" => session_data}} ->
+          case normalize_session(session_data, context) do
+            {:ok, session} ->
+              Session.save!(session)
 
-          if is_nil(session.session_token) do
-            {:error, :invalid_session_response, state}
-          else
-            Session.save!(session)
-            Logger.info("Handshake succeeded for team #{state.team_slug}")
-            {:ok, %{state | session: session, offline: false, force_handshake?: false}}
+              Logger.info("Handshake succeeded for team #{state.team_slug}")
+
+              {:ok,
+               %{
+                 state
+                 | session: session,
+                   offline: false,
+                   force_handshake?: false
+               }}
+
+            {:error, reason} ->
+              {:error, reason, state}
           end
 
         {:error, reason} ->
           {:error, reason, state}
       end
+    end
+  end
+
+  defp normalize_session(session_data, context) do
+    case session_data["session_id"] do
+      nil ->
+        {:error, :invalid_session_response}
+
+      _session_id ->
+        {:ok, Session.from_handshake_response(session_data, context)}
     end
   end
 
@@ -256,6 +335,7 @@ defmodule DevpulseAgent.Agent do
 
   defp fatal_shutdown(state, reason) do
     maybe_shutdown_supervisor(state.supervisor)
+
     {:stop, {:shutdown, reason}, state}
   end
 
@@ -263,13 +343,19 @@ defmodule DevpulseAgent.Agent do
 
   defp maybe_shutdown_supervisor(supervisor) when is_atom(supervisor) do
     case Process.whereis(supervisor) do
-      nil -> :ok
-      pid -> Process.exit(pid, :shutdown)
+      nil ->
+        :ok
+
+      pid ->
+        Process.exit(pid, :shutdown)
     end
   end
 
   defp maybe_shutdown_supervisor(supervisor) when is_pid(supervisor) do
-    if Process.alive?(supervisor), do: Process.exit(supervisor, :shutdown)
+    if Process.alive?(supervisor) do
+      Process.exit(supervisor, :shutdown)
+    end
+
     :ok
   end
 
@@ -278,39 +364,50 @@ defmodule DevpulseAgent.Agent do
     operating_system = operating_system()
 
     %{
-      team_slug: state.team_slug,
-      hostname: hostname,
-      operating_system: operating_system,
+      project_id: state.project_id,
       hardware_fingerprint:
-        hardware_fingerprint(hostname, operating_system, state.repo_metadata.repo_path),
-      project_name: state.repo_metadata.project_name,
-      repo_path: state.repo_metadata.repo_path,
-      git_remote_url: state.repo_metadata.remote_url,
-      server_url: state.config.server_url
+        hardware_fingerprint(
+          hostname,
+          operating_system,
+          state.repo_metadata.repo_path
+        ),
+      hostname: hostname,
+      operating_system: operating_system
     }
   end
 
   defp heartbeat_event(state, repo_metadata) do
     %{
       team_slug: state.team_slug,
-      session_id: state.session && state.session.session_id,
+      session_id: state.session.session_id,
+      project_id: state.project_id,
       project_name: repo_metadata.project_name,
       git_branch: repo_metadata.branch,
       repo_path: repo_metadata.repo_path,
       has_uncommitted_changes: repo_metadata.has_uncommitted_changes,
-      captured_at: DateTime.utc_now() |> DateTime.to_iso8601()
+      captured_at:
+        DateTime.utc_now()
+        |> DateTime.to_iso8601()
     }
   end
 
   defp refresh_repo_metadata(state) do
     case state.git.metadata(state.workspace_root) do
-      {:ok, metadata} -> metadata
-      {:error, _} -> state.repo_metadata
+      {:ok, metadata} ->
+        metadata
+
+      {:error, _} ->
+        state.repo_metadata
     end
   end
 
   defp schedule_next_tick(state) do
-    Process.send_after(self(), :tick, state.backoff_ms)
+    Process.send_after(
+      self(),
+      :tick,
+      state.backoff_ms
+    )
+
     {:noreply, state}
   end
 
@@ -343,15 +440,30 @@ defmodule DevpulseAgent.Agent do
     List.to_string(host)
   end
 
-  defp hardware_fingerprint(hostname, operating_system, repo_path) do
-    :crypto.hash(:sha256, Enum.join([hostname, operating_system, repo_path], "|"))
+  defp hardware_fingerprint(
+         hostname,
+         operating_system,
+         repo_path
+       ) do
+    :crypto.hash(
+      :sha256,
+      Enum.join(
+        [hostname, operating_system, repo_path],
+        "|"
+      )
+    )
     |> Base.encode16(case: :lower)
   end
 
-  defp format_reason({:http_error, status, _body}), do: "HTTP #{status}"
+  defp format_reason({:http_error, status, _body}) do
+    "HTTP #{status}"
+  end
 
-  defp format_reason({:ambiguous_team, teams}),
-    do: "multiple teams matched: #{Enum.join(teams, ", ")}"
+  defp format_reason({:ambiguous_team, teams}) do
+    "multiple teams matched: #{Enum.join(teams, ", ")}"
+  end
 
-  defp format_reason(reason), do: inspect(reason)
+  defp format_reason(reason) do
+    inspect(reason)
+  end
 end

@@ -7,6 +7,9 @@ defmodule DevpulseAgent.Session do
 
   defstruct [
     :session_id,
+    :project_id,
+    :project_name,
+    :git_remote_url,
     :session_token,
     :team_slug,
     :expires_at,
@@ -47,7 +50,6 @@ defmodule DevpulseAgent.Session do
   end
 
   def remaining_ms(nil), do: nil
-
   def remaining_ms(%__MODULE__{expires_at: nil}), do: nil
 
   def remaining_ms(%__MODULE__{expires_at: expires_at}) do
@@ -67,11 +69,19 @@ defmodule DevpulseAgent.Session do
 
     expires_at =
       parse_datetime(
-        pick(body, [:expires_at, :session_expires_at, "expires_at", "session_expires_at"])
+        pick(body, [
+          :expires_at,
+          :session_expires_at,
+          "expires_at",
+          "session_expires_at"
+        ])
       )
 
     %__MODULE__{
       session_id: pick(body, [:session_id, "session_id"]) || attrs[:session_id],
+      project_id: pick(body, [:project_id, "project_id"]) || attrs[:project_id],
+      project_name: pick(body, [:project_name, "project_name"]) || attrs[:project_name],
+      git_remote_url: pick(body, [:git_remote_url, "git_remote_url"]) || attrs[:git_remote_url],
       session_token: session_token,
       team_slug: attrs[:team_slug],
       expires_at: expires_at || expires_from_body(body),
@@ -86,6 +96,9 @@ defmodule DevpulseAgent.Session do
   def to_map(%__MODULE__{} = session) do
     %{
       session_id: session.session_id,
+      project_id: session.project_id,
+      project_name: session.project_name,
+      git_remote_url: session.git_remote_url,
       session_token: session.session_token,
       team_slug: session.team_slug,
       expires_at: encode_datetime(session.expires_at),
@@ -100,6 +113,9 @@ defmodule DevpulseAgent.Session do
   def from_map(attrs) when is_map(attrs) do
     %__MODULE__{
       session_id: pick(attrs, [:session_id, "session_id"]),
+      project_id: pick(attrs, [:project_id, "project_id"]),
+      project_name: pick(attrs, [:project_name, "project_name"]),
+      git_remote_url: pick(attrs, [:git_remote_url, "git_remote_url"]),
       session_token: pick(attrs, [:session_token, "session_token"]),
       team_slug: pick(attrs, [:team_slug, "team_slug"]),
       expires_at: parse_datetime(pick(attrs, [:expires_at, "expires_at"])),
