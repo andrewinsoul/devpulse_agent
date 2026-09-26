@@ -13,7 +13,8 @@ defmodule DevpulseAgent.Help do
         devpulse config get [key]
 
       VALID KEYS
-        server_url, token, default_team, heartbeat_interval_ms, offline_retention_ms, log_level
+        server_url, token, default_team, heartbeat_interval_ms, offline_retention_ms,
+        max_buffer_events, max_buffer_bytes, log_level
 
       OPTIONS
         -s, --server <url>     Override the server target for this query execution context
@@ -31,16 +32,17 @@ defmodule DevpulseAgent.Help do
         devpulse config set <key> <value>
 
       VALID KEYS
-        server_url, token, default_team, heartbeat_interval_ms, offline_retention_ms, log_level
+        server_url, token, default_team, heartbeat_interval_ms, offline_retention_ms,
+        max_buffer_events, max_buffer_bytes, log_level
       """,
       "login" => """
       NAME
         devpulse login
 
       DESCRIPTION
-        Authenticates this machine globally with the DevPulse server using an invitation token.
+        Authenticates this machine with the DevPulse server using an invitation token.
         Exchanges the invitation token for a permanent Personal Access Token (PAT) and
-        securely persists it to the global system configuration file.
+        securely persists the PAT plus the invitation's team/project assignment.
 
       USAGE
         devpulse login --token <invite_token>
@@ -53,9 +55,9 @@ defmodule DevpulseAgent.Help do
         devpulse init
 
       DESCRIPTION
-        Initializes a local project repository for DevPulse tracking. Uses the global
-        machine token to fetch available teams and projects, links the current Git directory,
-        and creates a tracking configuration context for the workspace.
+        Initializes the local Git repository assigned by the invitation. Uses the saved
+        team/project assignment, verifies the current Git remote, and creates the workspace
+        tracking configuration without asking the developer to select a project.
 
       USAGE
         devpulse init
@@ -92,6 +94,30 @@ defmodule DevpulseAgent.Help do
 
       OPTIONS
         -w, --workspace <dir>  Target a specific workspace directory context
+      """,
+      "doctor" => """
+      NAME
+        devpulse doctor
+
+      DESCRIPTION
+        Checks the current Git repository, workspace link, session state, and offline buffer,
+        then prints recommendations for anything that needs attention.
+
+      USAGE
+        devpulse doctor
+
+      OPTIONS
+        -w, --workspace <dir>  Target a specific workspace directory context
+      """,
+      "team list" => """
+      NAME
+        devpulse team list
+
+      DESCRIPTION
+        Lists locally linked workspaces with their team, project, and Git remote information.
+
+      USAGE
+        devpulse team list
       """,
       "start" => """
       NAME
@@ -140,6 +166,8 @@ defmodule DevpulseAgent.Help do
       start          Start active telemetry monitoring for this workspace
       stop           Stop background monitoring on this runtime
       status         Show comprehensive workspace and buffer status
+      doctor         Check local workspace and session health
+      team list       List locally linked workspaces
 
       config get     Display current configuration keys
       config set     Update configuration attributes

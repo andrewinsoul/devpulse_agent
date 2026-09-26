@@ -1,208 +1,268 @@
-# Manual Testing Guide
+# DevPulse Agent Manual Flow
 
-# NOTE
+This guide exercises the invitation-driven CLI flow manually. The developer does not select a project from the server. The CTO/team lead selects the team and repository when creating the invitation, and the CLI uses that assignment during `init`.
 
-I am getting rid of every team linking from the CLI, those are done by the team lead from the web side. On the CLI, devs  
-just need to use the link that their lead gives them which contains information of the team and the project —— the devs just need to link their local project to the project contained in the invite link via the init command.
+## 1. Prepare a Git repository
 
----
-
-This project is a good place to learn Elixir because the flow is small and easy to trace:
-
-- `CLI` receives commands
-- `Config` reads and writes local files
-- `Workspace` decides which team a folder belongs to
-- `Session` stores login data
-- `Agent` runs the long-lived heartbeat loop
-
-The easiest way to test safely is to use a temporary home directory so the app does not touch your real config.
-
-## 1. Start from the project root
-
-Run commands from the folder that contains `mix.exs`:
-
-```bash
-cd /Users/nature/Documents/elixir_projcets/dev_pulse/devpulse_agent
-```
-
-
-
-## 2. Use a temporary HOME
-
-This keeps config files isolated while you test:
-
-```bash
-export HOME="$(mktemp -d)"
-```
-
-If you want extra logs while learning, set:
-
-```bash
-export DEVPULSE_LOG_LEVEL=debug
-```
-
-
-
-## 3. Create a scratch Git repo
-
-The CLI expects a Git workspace for most commands:
+Use the repository that the team lead assigned in the invitation:
 
 ```bash
 mkdir -p /tmp/devpulse-playground
 cd /tmp/devpulse-playground
 git init
-touch README.md
+# Replace this with the actual remote assigned to the project on the server.
+git remote add origin https://github.com/your-org/your-repository.git
+printf "# DevPulse playground\n" > README.md
 git add README.md
-git commit -m "init"
+git commit -m "initial commit"
 ```
 
-If Git refuses to commit because your name or email is missing, set them once:
+The local `origin` URL must match the project’s `git_remote_url`. HTTPS and SSH forms of the same GitHub remote are accepted, for example:
 
-```bash
-git config --global user.name "Your Name"
-git config --global user.email "you@example.com"
+```text
+https://github.com/your-org/your-repository.git
+git@github.com:your-org/your-repository.git
 ```
 
+## 2. Confirm the server-side setup
 
+On the server, the team lead should have created:
 
-## 4. Run the smallest commands first
+1. A user account.
+2. An organization.
+3. A team.
+4. A project/repository under that team.
+5. A developer invitation containing both the team and project.
 
-Go back to the Elixir project folder, then try these one by one:
+The invitation payload now requires:
+
+```elixir
+%{
+  email: "developer@example.com",
+  team_id: team_id,
+  project_id: project_id
+}
+```
+
+The invitation page should display the assigned team, project, and Git remote URL.
+
+## 3. Configure the CLI server URL
+
+From the `devpulse_agent` repository:
 
 ```bash
-mix test
-mix run -e 'DevpulseAgent.CLI.main(["config","get"])'
-mix run -e 'DevpulseAgent.CLI.main(["config","set","default_team","core"])'
-mix run -e 'DevpulseAgent.CLI.main(["config","get","default_team"])'init
+export DEVPULSE_SERVER_URL=http://localhost:4000/api/v1
+```
+
+If running the compiled CLI instead of Mix, use the equivalent configuration mechanism supported by the installed binary.
+
+## 4. Log in with the invitation token
+
+The developer runs:
+
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["login", "--token", "dp_invite_..."])'
+```
+
+Expected behavior:
+
+- The server exchanges the accepted invitation for a PAT.
+- The CLI saves the PAT in the global DevPulse configuration.
+- The CLI saves the team/project assignment in a protected pending-assignment file.
+- The CLI prints the assigned team and project.
+- The CLI does not ask the developer to select a project.
+
+The pending assignment is intentionally separate from the global PAT. It is consumed by `init` when the developer links a local repository.
+
+If the accepted invitation requires browser reauthorization, the CLI opens the verification URL. After browser approval, the CLI polls the pairing status endpoint and stores the PAT and the same project assignment.
+
+## 5. Verify the login state
+
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["config", "get", "default_team"])'
+mix run -e 'DevpulseAgent.CLI.main(["whoami"])'
+```
+
+The global configuration should contain the authenticated team. The pending assignment should contain:
+
+- Team ID
+- Project ID
+- Project name
+- Project Git remote URL
+- Invitation ID when supplied by the server
+
+Do not print or copy the PAT into logs or tickets.
+
+## 6. Initialize the assigned repository
+
+Run `init` from the assigned local repository:
+
+```bash
+cd /tmp/devpulse-playground
+mix run -e 'DevpulseAgent.CLI.main(["init"])'
+```
+
+Or provide the path explicitly:
+
+```bash
 mix run -e 'DevpulseAgent.CLI.main(["init", "--workspace", "/tmp/devpulse-playground"])'
 ```
 
-What to learn here:
+Expected behavior:
 
-- `mix test` tells you whether the code still behaves as expected
-- `config get` shows the current stored settings
-- `config set` shows how local files are written
+1. The CLI reads the pending assignment from login.
+2. The CLI reads the current repository’s Git remote.
+3. The CLI compares the local remote with the invited project’s remote.
+4. The CLI writes `.devpulse.toml` with the assigned team and project.
+5. The CLI writes the workspace mapping.
+6. The pending assignment is removed after successful initialization.
+7. No project-selection prompt appears.
 
+Expected success output includes the assigned team, project, and local directory.
 
+## 7. Verify repository mismatch protection
 
-## 5. Test workspace lookup — Refactor
-
-Now ask the CLI to inspect the scratch repo:
-
-```bash
-mix run -e 'DevpulseAgent.CLI.main(["whoami","--workspace","/tmp/devpulse-playground","--team","core"])'
-mix run -e 'DevpulseAgent.CLI.main(["status","--workspace","/tmp/devpulse-playground","--team","core"])'
-```
-
-What to learn here:
-
-- `whoami` tells you what workspace and team the CLI believes it is using
-- `status` shows whether a session exists and what config values are active
-
-
-
-## 6. Test team linking — Ignore
-
-This writes a workspace-local file:
+Create or use a second repository with a different origin:
 
 ```bash
-mix run -e 'DevpulseAgent.CLI.main(["team","link","core","--workspace","/tmp/devpulse-playground"])'
-mix run -e 'DevpulseAgent.CLI.main(["whoami","--workspace","/tmp/devpulse-playground"])'
-mix run -e 'DevpulseAgent.CLI.main(["status","--workspace","/tmp/devpulse-playground"])'
+mkdir -p /tmp/devpulse-wrong-repo
+cd /tmp/devpulse-wrong-repo
+git init
+git remote add origin https://github.com/another-org/another-repository.git
 ```
 
-What to learn here:
-
-- `team link` stores the team in the workspace
-- the next commands should pick up that saved choice automatically
-- `team select` still works as a backward-compatible alias
-- if a workspace is already linked to a different team, the CLI should stop instead of overwriting it
-- `login` and `start` now re-save the resolved team after they know the workspace is safe
-
-
-
-## 7. Test the long-running agent last
-
-`start` is the background loop. It is the best command to inspect with logs, but run it only after the smaller commands are working:
+Run:
 
 ```bash
-mix run -e 'DevpulseAgent.CLI.main(["start","--workspace","/tmp/devpulse-playground"])'
+mix run -e 'DevpulseAgent.CLI.main(["init", "--workspace", "/tmp/devpulse-wrong-repo"])'
 ```
 
-What to watch for:
+Expected behavior:
 
-- startup messages from the CLI
-- `DevPulse agent ready for team ...`
-- heartbeat or handshake logs
-- retry or buffer logs when the server is offline
+- Initialization fails.
+- The CLI identifies the invited remote and current remote.
+- No workspace configuration is created for the wrong repository.
+- The pending assignment remains available for the correct repository.
 
+Example error:
 
+```text
+The current repository does not match the repository in the invitation.
+Invited repository: https://github.com/your-org/your-repository.git
+Current repository: https://github.com/another-org/another-repository.git
+```
 
-## 8. Test Developer reauthentication
+## 8. Verify initialized workspace state
 
-The developer accepted invite but was not able to complete the process with an alotted time, he just logs in again with his invite token in the CLI
+From the assigned repository:
 
 ```bash
- mix run -e 'DevpulseAgent.CLI.main(["login","--token","dp_invite_9LbsUwJTFOjPxvSRAxWMfA"])'
+mix run -e 'DevpulseAgent.CLI.main(["whoami", "--workspace", "/tmp/devpulse-playground"])'
+mix run -e 'DevpulseAgent.CLI.main(["status", "--workspace", "/tmp/devpulse-playground"])'
+mix run -e 'DevpulseAgent.CLI.main(["doctor", "--workspace", "/tmp/devpulse-playground"])'
 ```
 
+Verify that:
 
+- The workspace resolves to the assigned project.
+- The team is resolved from `.devpulse.toml`.
+- No project selection is required.
+- The session is initially absent until `start` performs the handshake.
+- `doctor` reports that the Git repository and workspace link are healthy.
 
-## 9. Test Developer Accept Invite Process
+## 9. Start the agent
 
-Ideally, this one is done on the browser and as soon as the developer is done, he is redirected to a page with instructions on how to proceed
+Start the long-running process:
 
 ```bash
-They click the link on the mail and a form with mail prepopulated and disabled is displayed
-```
-
-
-
-## 10. Start heart beat, after successfully authenticating, start sending heart beats on pulse to devpulse_server
-
-1. Start heartbeat to server by calling this endpoint
-
-```
 mix run -e 'DevpulseAgent.CLI.main(["start", "--workspace", "/tmp/devpulse-playground"])'
 ```
 
+Expected behavior:
 
+- The agent uses the saved PAT for the handshake.
+- The server verifies the assigned project and returns a short-lived session token.
+- The CLI uses the session token for heartbeats.
+- The agent monitors Git state and sends periodic heartbeat events.
+- The process remains in the foreground.
 
-## 8. Good places for learning logs
+Do not use the PAT or invitation token as the heartbeat credential.
 
-Add small `Logger.debug/1` or `Logger.info/1` lines in these places:
+From another terminal, inspect status:
 
-- `lib/devpulse_agent/cli.ex` for command parsing and dispatch
-- `lib/devpulse_agent/workspace.ex` for team resolution
-- `lib/devpulse_agent/config.ex` for file reads and writes
-- `lib/devpulse_agent/agent.ex` for session setup, handshake, heartbeat, and retries
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["status", "--workspace", "/tmp/devpulse-playground"])'
+```
 
-Keep secrets out of logs:
+## 10. Stop the agent
 
-- do not print `master_api_token`
-- do not print `session_token`
+From a second terminal:
 
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["stop", "--workspace", "/tmp/devpulse-playground"])'
+```
 
+Expected behavior:
 
-## 9. A simple learning order
+- The workspace-scoped agent lock is found.
+- The running agent stops gracefully.
+- A subsequent `status` reports that the agent is not running.
 
-If your goal is to master Elixir while building this app, this order works well:
+## 11. Inspect local linked workspaces
 
-1. Learn how function clauses work in `CLI` and `Workspace`
-2. Learn structs and maps in `Session` and `Config`
-3. Learn pattern matching and guards in `Agent`
-4. Learn `GenServer` life cycle events like `init/1`, `handle_info/2`, and `handle_call/3`
-5. Learn supervision with `RunnerSupervisor`
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["team", "list"])'
+```
 
+This reads local workspace mappings and displays their team, project/workspace name, and Git remote. It does not fetch a fresh project list from the server.
 
+## 12. Verify configuration values
 
-## 10. A good test habit
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["config", "get"])'
+mix run -e 'DevpulseAgent.CLI.main(["config", "get", "server_url"])'
+mix run -e 'DevpulseAgent.CLI.main(["config", "get", "heartbeat_interval_ms"])'
+```
 
-When you make a change:
+Configuration can be changed with:
 
-1. run `mix test`
-2. run one CLI command
-3. read the logs
-4. change only one thing at a time
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["config", "set", "heartbeat_interval_ms", "10000"])'
+```
 
-That makes it much easier to understand what Elixir is doing.
+## 13. Useful help commands
+
+```bash
+mix run -e 'DevpulseAgent.CLI.main(["help"])'
+mix run -e 'DevpulseAgent.CLI.main(["help", "login"])'
+mix run -e 'DevpulseAgent.CLI.main(["help", "init"])'
+mix run -e 'DevpulseAgent.CLI.main(["help", "start"])'
+```
+
+## 14. Troubleshooting checklist
+
+If `login` fails:
+
+- Confirm the invitation token is accepted and has not expired.
+- Confirm the server URL points to the running DevPulse server.
+- Confirm the invitation contains a project assignment.
+
+If `init` fails with a missing assignment:
+
+- Run `login` again with the invitation token.
+- Confirm the server exchange response contains `project` and `assignment` fields.
+
+If `init` fails with a repository mismatch:
+
+- Run `git remote get-url origin`.
+- Compare it with the repository URL shown in the invitation.
+- Run `init` from the repository assigned by the team lead.
+
+If `start` fails:
+
+- Run `doctor` and `status` first.
+- Confirm the workspace has been initialized.
+- Confirm the server is running and reachable.
+- Confirm the PAT is present and the session has not been revoked.
+
+The native interactive terminal still requires a working Rust/Cargo toolchain when running the CLI in the development environment.

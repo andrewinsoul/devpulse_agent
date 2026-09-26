@@ -70,6 +70,14 @@ defmodule DevpulseAgent.Git do
     end
   end
 
+  def remote_matches?(expected, actual)
+
+  def remote_matches?(expected, actual) when is_binary(expected) and is_binary(actual) do
+    normalize_remote(expected) == normalize_remote(actual)
+  end
+
+  def remote_matches?(_expected, _actual), do: false
+
   def remote_url(path \\ File.cwd!()) do
     case run_git(path, ["remote", "get-url", "origin"]) do
       {:ok, url} ->
@@ -88,6 +96,18 @@ defmodule DevpulseAgent.Git do
       {output, 0} -> String.trim(output) != ""
       _ -> false
     end
+  end
+
+  defp normalize_remote(remote) do
+    remote
+    |> String.trim()
+    |> String.downcase()
+    |> String.replace(~r/^git@([^:]+):/, "\\1/")
+    |> String.replace(~r/^ssh:\/\/git@/, "")
+    |> String.replace(~r/^https?:\/\//, "")
+    |> String.trim_leading("/")
+    |> String.trim_trailing("/")
+    |> String.trim_trailing(".git")
   end
 
   defp run_git(path, args) do

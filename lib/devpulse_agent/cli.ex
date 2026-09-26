@@ -3,20 +3,12 @@ defmodule DevpulseAgent.CLI do
   Entry point for the DevPulse CLI binary.
   """
 
-  require Logger
+  # require Logger
 
-  alias DevpulseAgent.Utils.{Suggestion, Formatter, Prompt}
-  alias DevpulseAgent.{Agent, Buffer, Client, Config, Git, Session, Workspace, Help}
+  alias DevpulseAgent.Utils.{Suggestion, Formatter}
+  alias DevpulseAgent.{Buffer, Client, Config, Git, Help, Lifecycle, Session, Workspace}
 
   def main(args) do
-    case Dotenvy.source([".env", System.get_env()]) do
-      {:ok, env} ->
-        System.put_env(env)
-
-      {:error, reason} ->
-        IO.warn("Failed to load .env: #{inspect(reason)}")
-    end
-
     Application.ensure_all_started(:devpulse_agent)
 
     case dispatch(args) do
@@ -132,8 +124,9 @@ defmodule DevpulseAgent.CLI do
 
     workspace = workspace_root(opts)
     config = Config.load() |> merge_cli_overrides(opts)
-    session = Session.load()
-    buffered = Buffer.load()
+    {session_file, buffer_file} = scoped_state_files(workspace)
+    session = if session_file, do: Session.load(session_file), else: nil
+    buffered = if buffer_file, do: Buffer.load(buffer_file), else: []
 
     git_repo? = git_repository?(workspace)
 
@@ -147,13 +140,14 @@ defmodule DevpulseAgent.CLI do
     session_valid? = session_valid?(session)
 
     buffer_size = length(buffered)
+    server_reachable? = server_reachable?(config[:server_url] || config["server_url"])
 
     rows = [
       ["Git Repository", yes_no(git_repo?)],
       ["Workspace Linked", yes_no(workspace_linked?)],
       ["Session Found", yes_no(session_found?)],
       ["Session Valid", yes_no(session_valid?)],
-      ["Server Reachable", Formatter.warning("TODO")],
+      ["Server Reachable", yes_no(server_reachable?)],
       ["Offline Buffer", "#{yes_no(buffer_size < 100)} (#{buffer_size} pending)"]
     ]
 
@@ -168,7 +162,8 @@ defmodule DevpulseAgent.CLI do
         git_repo?,
         workspace_linked?,
         session_found?,
-        session_valid?
+        session_valid?,
+        server_reachable?
       )
 
     if recommendations == [] do
@@ -190,6 +185,13 @@ defmodule DevpulseAgent.CLI do
     :ok
   end
 
+  defp server_reachable?(server_url) do
+    case Client.check_server(server_url) do
+      {:ok, status} when is_integer(status) and status in 100..599 -> true
+      _ -> false
+    end
+  end
+
   defp git_repository?(workspace) do
     match?({:ok, _}, Git.metadata(workspace))
   end
@@ -204,7 +206,8 @@ defmodule DevpulseAgent.CLI do
          git_repo?,
          workspace_linked?,
          session_found?,
-         session_valid?
+         session_valid?,
+         server_reachable?
        ) do
     []
     |> maybe_add(
@@ -213,7 +216,7 @@ defmodule DevpulseAgent.CLI do
     )
     |> maybe_add(
       not workspace_linked?,
-      "Link this workspace using: devpulse team link <team>"
+      "Initialize this workspace using: devpulse init"
     )
     |> maybe_add(
       not session_found?,
@@ -222,6 +225,10 @@ defmodule DevpulseAgent.CLI do
     |> maybe_add(
       session_found? and not session_valid?,
       "Your session has expired. Run: devpulse login"
+    )
+    |> maybe_add(
+      not server_reachable?,
+      "DevPulse server is unreachable. Check the configured server URL and server status."
     )
   end
 
@@ -259,109 +266,176 @@ defmodule DevpulseAgent.CLI do
         aliases: common_aliases()
       )
 
-    workspace_path = Keyword.get(opts, :workspace) || File.cwd!()
-
-    config = Config.load()
-
+    requested_workspace = Path.expand(Keyword.get(opts, :workspace) || File.cwd!())
+    config = Config.load() |> merge_cli_overrides(opts)
     token = Map.get(config, :token)
-
-    if is_nil(token) do
-      IO.puts(
-        :stderr,
-        "❌ Error: Not authenticated. Run `devpulse login --token <invite_token>` first."
-      )
-
-      System.halt(1)
-    end
-
     team_info = config[:team] || config["team"] || %{}
+    team_slug = config[:default_team] || team_info[:slug] || team_info["slug"]
 
-    team_id = team_info[:id] || team_info["id"]
+    cond do
+      is_nil(token) or token == "" ->
+        {:error, :missing_master_api_token}
 
-    team_slug =
-      config[:default_team] || team_info[:slug] || team_info["slug"]
+      is_nil(team_slug) or team_slug == "" ->
+        {:error, :team_not_available}
 
-    if is_nil(team_id) or team_id == "" do
-      IO.puts(:stderr, "❌ Error: No associated team found in config. Please re-authenticate.")
-      System.halt(1)
+      true ->
+        with {:ok, repo_metadata} <- Git.metadata(requested_workspace),
+             {:ok, assignment} <- resolve_init_assignment(repo_metadata.repo_path),
+             :ok <- validate_assignment_remote(assignment, repo_metadata.remote_url),
+             :ok <-
+               initialize_workspace(
+                 repo_metadata.repo_path,
+                 config,
+                 team_info,
+                 team_slug,
+                 assignment
+               ) do
+          :ok
+        end
     end
+  end
 
-    base_url = System.get_env("api_base_url", "http://localhost:4000/api/v1")
+  defp resolve_init_assignment(workspace_path) do
+    case Config.load_pending_assignment() do
+      assignment when is_map(assignment) ->
+        normalize_assignment(assignment)
 
-    projects = Client.get_projects(base_url, token, team_id)
+      nil ->
+        workspace_config = Config.load_workspace_config(workspace_path)
 
-    if projects == [] do
-      IO.puts(:stderr, "❌ No repositories found for team: #{team_slug}")
-      System.halt(1)
+        project = %{
+          "id" => workspace_config[:project_id] || workspace_config["project_id"],
+          "name" => workspace_config[:project_name] || workspace_config["project_name"],
+          "git_remote_url" =>
+            workspace_config[:project_remote_url] || workspace_config["project_remote_url"]
+        }
+
+        team = %{
+          "id" => workspace_config[:team_id] || workspace_config["team_id"],
+          "name" => workspace_config[:team_name] || workspace_config["team_name"],
+          "slug" => workspace_config[:team_slug] || workspace_config["team_slug"]
+        }
+
+        normalize_assignment(%{
+          "team" => team,
+          "project" => project,
+          "assignment" => %{
+            "team_id" => team["id"],
+            "project_id" => project["id"]
+          }
+        })
     end
+  end
 
-    project_names = Enum.map(projects, & &1["name"])
+  defp normalize_assignment(assignment) do
+    team = assignment[:team] || assignment["team"] || %{}
+    project = assignment[:project] || assignment["project"] || %{}
+    assignment_data = assignment[:assignment] || assignment["assignment"] || %{}
 
-    selected_project_name =
-      Prompt.select(
-        "Select a repository",
-        project_names
-      )
+    project_id =
+      project[:id] || project["id"] || assignment_data[:project_id] ||
+        assignment_data["project_id"]
 
-    selected_project = Enum.find(projects, &(&1["name"] == selected_project_name))
+    project_name = project[:name] || project["name"]
+
+    project_remote_url =
+      project[:git_remote_url] || project["git_remote_url"] || project[:remote_url] ||
+        project["remote_url"]
+
+    cond do
+      is_nil(project_id) or project_id == "" ->
+        {:error, :invalid_project_assignment}
+
+      is_nil(project_name) or project_name == "" ->
+        {:error, :invalid_project_assignment}
+
+      is_nil(project_remote_url) or project_remote_url == "" ->
+        {:error, :invalid_project_assignment}
+
+      true ->
+        {:ok,
+         %{
+           team: team,
+           project: %{
+             "id" => project_id,
+             "name" => project_name,
+             "git_remote_url" => project_remote_url
+           },
+           assignment: assignment_data
+         }}
+    end
+  end
+
+  defp validate_assignment_remote(assignment, actual_remote_url) do
+    expected_remote_url = assignment.project["git_remote_url"]
+
+    cond do
+      is_nil(actual_remote_url) or actual_remote_url == "" ->
+        {:error, {:repository_remote_missing, expected_remote_url}}
+
+      Git.remote_matches?(expected_remote_url, actual_remote_url) ->
+        :ok
+
+      true ->
+        {:error, {:repository_mismatch, expected_remote_url, actual_remote_url}}
+    end
+  end
+
+  defp initialize_workspace(workspace_path, config, team_info, team_slug, assignment) do
+    project_data = assignment.project
+    project_remote_url = project_data["git_remote_url"]
+    invited_team = assignment[:team] || assignment["team"] || %{}
 
     team_data = %{
-      "id" => team_info[:id] || team_info["id"],
-      "name" => team_info[:name] || team_info["name"] || team_slug,
-      "slug" => team_slug
+      "id" => invited_team[:id] || invited_team["id"] || team_info[:id] || team_info["id"],
+      "name" =>
+        invited_team[:name] || invited_team["name"] || team_info[:name] || team_info["name"] ||
+          team_slug,
+      "slug" => invited_team[:slug] || invited_team["slug"] || team_slug
     }
 
-    project_data = %{
-      "id" => selected_project["id"],
-      "name" => selected_project["name"],
-      "git_remote_url" => selected_project["remote_url"]
-    }
+    team_slug = team_data["slug"]
 
-    Config.save_workspace_config(workspace_path, %{
-      workspace_path: Path.expand(workspace_path),
-      team: team_data,
-      project: project_data
-    })
+    with {:ok, _workspace_file} <-
+           Config.save_workspace_config(workspace_path, %{
+             workspace_path: workspace_path,
+             team: team_data,
+             project: project_data
+           }) do
+      new_workspace_mapping = %{
+        path: workspace_path,
+        team_slug: team_slug,
+        project_slug: project_data["id"],
+        remote_url: project_remote_url
+      }
 
-    new_workspace_mapping = %{
-      path: Path.expand(workspace_path),
-      team_slug: team_slug,
-      project_slug: selected_project["slug"],
-      remote_url: selected_project["git_remote_url"]
-    }
+      updated_mappings =
+        config
+        |> Map.get(:workspace_mappings, [])
+        |> Enum.reject(fn mapping ->
+          (mapping[:path] || mapping["path"]) == workspace_path
+        end)
+        |> Kernel.++([new_workspace_mapping])
 
-    team_with_projects = Map.put(team_data, "projects", [project_data])
+      updated_config = Map.put(config, :workspace_mappings, updated_mappings)
+      Config.save!(updated_config)
+      Config.clear_pending_assignment!()
 
-    existing_teams = Map.get(config, :team_mappings, [])
+      IO.puts("")
+      IO.puts("────────────────────────────────────────────")
+      IO.puts("")
+      IO.puts(IO.ANSI.green() <> "✓ Workspace initialized" <> IO.ANSI.reset())
+      IO.puts("")
 
-    updated_teams =
-      Enum.reject(existing_teams, fn t -> (t[:slug] || t["slug"]) == team_slug end) ++
-        [team_with_projects]
+      Formatter.print_table(
+        headers: ["TEAM", "PROJECT", "LOCAL DIR."],
+        rows: [[team_data["name"], project_data["name"], workspace_path]]
+      )
 
-    updated_mappings =
-      Enum.reject(Map.get(config, :workspace_mappings, []), fn m ->
-        m.path == Path.expand(workspace_path)
-      end) ++ [new_workspace_mapping]
-
-    updated_config =
-      config
-      |> Map.put(:team_mappings, updated_teams)
-      |> Map.put(:workspace_mappings, updated_mappings)
-
-    Config.save!(updated_config)
-
-    IO.puts("")
-    IO.puts("────────────────────────────────────────────")
-    IO.puts("")
-    IO.puts(IO.ANSI.green() <> "✓ Workspace initialized" <> IO.ANSI.reset())
-    IO.puts("")
-
-    Formatter.print_table(
-      headers: ["TEAM", "PROJECT", "LOCAL DIR."],
-      rows: [[team_data["name"], selected_project["name"], workspace_path]]
-    )
-
-    IO.puts("")
+      IO.puts("")
+      :ok
+    end
   end
 
   defp run_help([]), do: IO.puts(Help.show_generic_help_info())
@@ -418,14 +492,15 @@ defmodule DevpulseAgent.CLI do
       OptionParser.parse(args, switches: common_switches(), aliases: common_aliases())
 
     invite_token = Keyword.get(opts, :token)
+    config = Config.load() |> merge_cli_overrides(opts)
 
     if is_nil(invite_token) do
       IO.puts(:stderr, "Error: Missing invite token. Usage: devpulse login --token <your_token>")
       System.halt(1)
     end
 
-    case authenticate_machine(invite_token) do
-      {:ok, %{token: token, team: team}} ->
+    case authenticate_machine(config.server_url, invite_token) do
+      {:ok, %{token: token, team: team, project: project, assignment: assignment}} ->
         current_config = Config.load()
 
         current_config
@@ -434,13 +509,18 @@ defmodule DevpulseAgent.CLI do
         |> Map.put(:default_team, team["slug"] || team[:slug])
         |> Config.save!()
 
+        Config.save_pending_assignment!(%{
+          "team" => team,
+          "project" => project,
+          "assignment" => assignment
+        })
+
         IO.puts(
-          "🎉 You have successfully logged in globally for team '#{team["name"]}'! Run `devpulse init` inside a repository to connect your project."
+          "🎉 You have successfully logged in for team '#{team["name"]}' and project '#{project["name"]}'! Run `devpulse init` inside the assigned repository."
         )
 
       {:ok, :retrigger, %{"verification_url" => url, "pairing_code" => code}} ->
-        base_url =
-          System.get_env("api_base_url", "http://localhost:4000/api/v1")
+        base_url = config.server_url
 
         IO.puts("""
 
@@ -457,20 +537,28 @@ defmodule DevpulseAgent.CLI do
         open_browser(url)
 
         case await_authorization(base_url, code) do
-          {:ok, %{"token" => token, "team" => team} = config} ->
+          {:ok,
+           %{"token" => token, "team" => team, "project" => project, "assignment" => assignment}} ->
             config_to_save =
-              config
-              |> Map.delete("token")
+              Config.load()
               |> Map.put(:token, token)
-              |> Map.delete("team")
               |> Map.put(:team, team)
+              |> Map.put(:default_team, team["slug"] || team[:slug])
 
             Config.save!(config_to_save)
+
+            Config.save_pending_assignment!(%{
+              "team" => team,
+              "project" => project,
+              "assignment" => assignment
+            })
 
             IO.puts("""
 
             \e[32m\e[1m🎉 Successfully re-authenticated!\e[0m
-            Run `devpulse init` inside a repository to connect your project.
+            Team: #{team["name"]}
+            Project: #{project["name"]}
+            Run `devpulse init` inside the assigned repository.
             """)
 
           {:error, reason} ->
@@ -516,8 +604,10 @@ defmodule DevpulseAgent.CLI do
     workspace = workspace_root(opts)
     config = Config.load() |> merge_cli_overrides(opts)
 
-    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config) do
-      session = Session.load()
+    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config),
+         {:ok, project_info} <- Workspace.resolve_project(workspace) do
+      session_file = Config.state_file(workspace, project_info.project_id, "session.json")
+      session = Session.load(session_file)
 
       Formatter.print_table(
         headers: ["PROPERTY", "VALUE"],
@@ -562,10 +652,16 @@ defmodule DevpulseAgent.CLI do
 
     workspace = workspace_root(opts)
     config = Config.load() |> merge_cli_overrides(opts)
-    session = Session.load()
-    buffered = Buffer.load()
 
-    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config) do
+    with {:ok, team_slug} <- resolve_team_choice(workspace, opts, config),
+         {:ok, project_info} <- Workspace.resolve_project(workspace) do
+      session_file = Config.state_file(workspace, project_info.project_id, "session.json")
+      buffer_file = Config.state_file(workspace, project_info.project_id, "buffer.ndjson")
+      lock_file = Lifecycle.lock_file(workspace, project_info.project_id)
+      session = Session.load(session_file)
+      buffered = Buffer.load(buffer_file)
+      lifecycle = Lifecycle.status(lock_file)
+
       Formatter.print_table(
         title: "DevPulse Status",
         headers: ["PROPERTY", "VALUE"],
@@ -573,6 +669,7 @@ defmodule DevpulseAgent.CLI do
           ["Server URL", config.server_url],
           ["Workspace", workspace],
           ["Team", team_slug],
+          ["Agent Lock", format_lifecycle(lifecycle)],
           ["Session Active", yes_no(not is_nil(session) and not Session.expired?(session))],
           ["Session Expires", format_datetime(session && session.expires_at)],
           ["Buffered Heartbeats", length(buffered)],
@@ -588,6 +685,11 @@ defmodule DevpulseAgent.CLI do
 
   defp yes_no(true), do: Formatter.green("✔")
   defp yes_no(false), do: Formatter.red("✖")
+
+  defp format_lifecycle({:running, pid}), do: "running (PID #{pid})"
+  defp format_lifecycle(:not_running), do: "not running"
+  defp format_lifecycle(:stale), do: Formatter.warning("stale lock")
+  defp format_lifecycle(:invalid), do: Formatter.warning("invalid lock")
 
   defp run_config_get(args) do
     {opts, positional, _} =
@@ -695,31 +797,55 @@ defmodule DevpulseAgent.CLI do
     end
   end
 
-  defp run_stop(_args) do
-    case Process.whereis(Agent) do
-      nil ->
-        IO.puts("DevPulse agent is not running in this VM")
+  defp run_stop(args) do
+    {opts, _, _} =
+      OptionParser.parse(args,
+        switches: common_switches(),
+        aliases: common_aliases()
+      )
+
+    workspace = workspace_root(opts)
+
+    with {:ok, project_info} <- Workspace.resolve_project(workspace),
+         {:ok, result} <- Lifecycle.stop(workspace, project_info.project_id) do
+      case result do
+        :stopping -> IO.puts("Stopping DevPulse agent")
+        :stale_lock_removed -> IO.puts("Removed stale DevPulse agent lock")
+      end
+
+      :ok
+    else
+      {:error, :not_running} ->
+        IO.puts("DevPulse agent is not running")
         :ok
 
-      pid ->
-        Agent.stop(pid)
-        IO.puts("Stopped DevPulse agent")
-        :ok
+      {:error, :project_not_initialized} ->
+        {:error, :project_not_initialized}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp authenticate_machine(invite_token) do
+  defp authenticate_machine(base_url, invite_token) do
     if is_nil(invite_token) do
       {:error, "token is required, pass the invite token using the token flag"}
     else
-      base_url =
-        System.get_env("api_base_url", "http://localhost:4000/api/v1")
-
       case Client.exchange_invite(base_url, invite_token) do
-        {:ok, %{"status" => "success", "token" => pat, "team" => team}} ->
-          {:ok, %{token: pat, team: team}}
+        {:ok,
+         %{
+           "status" => "success",
+           "token" => pat,
+           "team" => team,
+           "project" => project,
+           "assignment" => assignment
+         }} ->
+          {:ok, %{token: pat, team: team, project: project, assignment: assignment}}
 
-        {:error, {reason, _body}} when reason in [:unauthorized, :not_found] ->
+        {:error, :unauthorized} ->
+          Client.retrigger_auth(base_url, invite_token)
+
+        {:error, {:http_error, 404, _body}} ->
           Client.retrigger_auth(base_url, invite_token)
 
         {:error, {:transport_error, reason}} ->
@@ -811,12 +937,27 @@ defmodule DevpulseAgent.CLI do
   defp workspace_root(opts),
     do: Path.expand(Keyword.get(opts, :workspace, Keyword.get(opts, :path, File.cwd!())))
 
+  defp scoped_state_files(workspace) do
+    case Workspace.resolve_project(workspace) do
+      {:ok, project_info} ->
+        {
+          Config.state_file(workspace, project_info.project_id, "session.json"),
+          Config.state_file(workspace, project_info.project_id, "buffer.ndjson")
+        }
+
+      _ ->
+        {nil, nil}
+    end
+  end
+
   defp merge_cli_overrides(config, opts) do
     config
     |> maybe_put(:server_url, Keyword.get(opts, :server))
     |> maybe_put(:token, Keyword.get(opts, :token))
     |> maybe_put(:heartbeat_interval_ms, Keyword.get(opts, :heartbeat_interval_ms))
     |> maybe_put(:offline_retention_ms, Keyword.get(opts, :offline_retention_ms))
+    |> maybe_put(:max_buffer_events, Keyword.get(opts, :max_buffer_events))
+    |> maybe_put(:max_buffer_bytes, Keyword.get(opts, :max_buffer_bytes))
     |> maybe_put(:log_level, Keyword.get(opts, :log_level))
   end
 
@@ -832,6 +973,8 @@ defmodule DevpulseAgent.CLI do
       team: :string,
       heartbeat_interval_ms: :integer,
       offline_retention_ms: :integer,
+      max_buffer_events: :integer,
+      max_buffer_bytes: :integer,
       log_level: :string,
       force_handshake: :boolean
     ]
@@ -851,14 +994,22 @@ defmodule DevpulseAgent.CLI do
 
   defp cast_config_value(:heartbeat_interval_ms, value), do: Config.parse_integer(value) || value
   defp cast_config_value(:offline_retention_ms, value), do: Config.parse_integer(value) || value
+  defp cast_config_value(:max_buffer_events, value), do: Config.parse_integer(value) || value
+  defp cast_config_value(:max_buffer_bytes, value), do: Config.parse_integer(value) || value
   defp cast_config_value(_key, value), do: value
 
   defp format_datetime(nil), do: "unknown"
   defp format_datetime(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
-  defp format_datetime(value) when is_binary(value), do: value
+  # defp format_datetime(value) when is_binary(value), do: value
 
   defp format_reason({:not_git_repo, workspace}), do: "#{workspace} is not a git repository"
   defp format_reason(:team_required), do: "workspace team selection is required"
+
+  defp format_reason(:already_running),
+    do: "a DevPulse agent is already running for this workspace"
+
+  defp format_reason(:project_not_initialized),
+    do: "workspace is not initialized; run devpulse init"
 
   defp format_reason({:ambiguous_team, teams}),
     do: "ambiguous team mapping: #{Enum.join(teams, ", ")}"
@@ -867,6 +1018,30 @@ defmodule DevpulseAgent.CLI do
     do: "workspace is already linked to #{existing_team}; cannot link #{requested_team}"
 
   defp format_reason(:missing_master_api_token), do: "master API token is missing"
+
+  defp format_reason(:team_not_available),
+    do: "no authenticated team is available; run login again"
+
+  defp format_reason({:no_projects, team}), do: "no repositories found for team: #{team}"
+
+  defp format_reason({:project_fetch_failed, reason}),
+    do: "failed to fetch repositories: #{format_reason(reason)}"
+
+  defp format_reason(:invalid_project_selection),
+    do: "the selected repository is no longer available"
+
+  defp format_reason(:invalid_project_response), do: "server returned incomplete repository data"
+
+  defp format_reason(:invalid_project_assignment),
+    do: "login did not return a complete project assignment"
+
+  defp format_reason({:repository_remote_missing, expected_remote}),
+    do: "the current repository has no origin remote; expected #{expected_remote}"
+
+  defp format_reason({:repository_mismatch, expected_remote, actual_remote}),
+    do:
+      "the current repository does not match the repository in the invitation\nInvited repository: #{expected_remote}\nCurrent repository: #{actual_remote}"
+
   defp format_reason(:team_link_requires_a_team_slug), do: "team link requires a team slug"
 
   defp format_reason(:invalid_config_key),
@@ -905,11 +1080,12 @@ defmodule DevpulseAgent.CLI do
   defp config_key_atom(key) do
     case String.trim(key) do
       "server_url" -> :server_url
-      "master_api_token" -> :master_api_token
       "token" -> :token
       "default_team" -> :default_team
       "heartbeat_interval_ms" -> :heartbeat_interval_ms
       "offline_retention_ms" -> :offline_retention_ms
+      "max_buffer_events" -> :max_buffer_events
+      "max_buffer_bytes" -> :max_buffer_bytes
       "log_level" -> :log_level
       "workspace_mappings" -> :workspace_mappings
       _ -> nil

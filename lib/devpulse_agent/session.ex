@@ -20,23 +20,23 @@ defmodule DevpulseAgent.Session do
     :server_url
   ]
 
-  def load do
-    case Config.load_session() do
+  def load(file \\ Config.session_file()) do
+    case Config.load_session(file) do
       nil -> nil
       attrs -> from_map(attrs)
     end
   end
 
-  def save!(%__MODULE__{} = session) do
+  def save!(%__MODULE__{} = session, file \\ Config.session_file()) do
     session
     |> to_map()
-    |> Config.save_session!()
+    |> Config.save_session!(file)
   end
 
-  def clear!, do: Config.clear_session!()
+  def clear!(file \\ Config.session_file()), do: Config.clear_session!(file)
 
   def expired?(nil), do: true
-  def expired?(%__MODULE__{expires_at: nil}), do: false
+  def expired?(%__MODULE__{expires_at: nil}), do: true
 
   def expired?(%__MODULE__{expires_at: expires_at}) do
     DateTime.compare(DateTime.utc_now(), expires_at) != :lt

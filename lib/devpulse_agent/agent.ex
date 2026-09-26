@@ -3,7 +3,7 @@ defmodule DevpulseAgent.Agent do
 
   require Logger
 
-  alias DevpulseAgent.{Buffer, Client, Config, Git, Session, Workspace}
+  alias DevpulseAgent.{Buffer, Client, Config, Git, Lifecycle, Session, Workspace}
 
   @max_backoff_ms 60_000
 
@@ -27,29 +27,43 @@ defmodule DevpulseAgent.Agent do
   @impl true
   def init(opts) do
     workspace_root = Path.expand(Keyword.get(opts, :workspace, File.cwd!()))
-    config = Keyword.get(opts, :config, Config.load())
+
+    config =
+      opts
+      |> Keyword.get(:config, Config.load())
+      |> Config.normalize()
+
     client = Keyword.get(opts, :client, Client)
     git = Keyword.get(opts, :git, Git)
 
     with {:ok, repo_metadata} <- git.metadata(workspace_root),
          {:ok, team_slug, team_source} <-
            Workspace.resolve_team(workspace_root, repo_metadata, opts, config),
-         {:ok, project_info} <- Workspace.resolve_project(workspace_root) do
+         {:ok, project_info} <- Workspace.resolve_project(workspace_root),
+         {:ok, lifecycle_file} <-
+           Lifecycle.acquire(workspace_root, project_info[:project_id]) do
+      project_id = project_info[:project_id]
+      session_file = Config.state_file(workspace_root, project_id, "session.json")
+      buffer_file = Config.state_file(workspace_root, project_id, "buffer.ndjson")
+
       state = %{
         workspace_root: workspace_root,
         repo_metadata: repo_metadata,
         team_slug: team_slug,
-        project_id: project_info[:project_id],
+        project_id: project_id,
         project_name: project_info[:project_name],
         team_source: team_source,
         config: config,
         client: client,
         git: git,
-        session: nil,
+        session: Session.load(session_file),
+        session_file: session_file,
+        buffer_file: buffer_file,
+        lifecycle_file: lifecycle_file,
         supervisor: Keyword.get(opts, :supervisor),
         offline: false,
         backoff_ms: config.heartbeat_interval_ms,
-        force_handshake?: true
+        force_handshake?: Keyword.get(opts, :force_handshake, false)
       }
 
       IO.puts("DevPulse agent ready for team #{team_slug}")
@@ -70,6 +84,12 @@ defmodule DevpulseAgent.Agent do
         Logger.error("DevPulse workspace maps to multiple teams: #{Enum.join(teams, ", ")}")
 
         {:stop, {:ambiguous_team, teams}}
+
+      {:error, :already_running} ->
+        {:stop, :already_running}
+
+      {:error, reason} ->
+        {:stop, reason}
     end
   end
 
@@ -102,8 +122,19 @@ defmodule DevpulseAgent.Agent do
     retention_ms = state.config.offline_retention_ms
 
     buffered_events =
-      Buffer.load()
+      state.buffer_file
+      |> Buffer.load()
       |> Buffer.prune(retention_ms)
+
+    {buffered_events, dropped_count} = bound_buffer(buffered_events, state)
+
+    if dropped_count > 0 do
+      Logger.warning(
+        "Dropped #{dropped_count} buffered heartbeat(s) because the local buffer limit was reached"
+      )
+
+      Buffer.replace!(buffered_events, state.buffer_file)
+    end
 
     case flush_buffer(buffered_events, state) do
       {:ok, remaining_events, updated_state} ->
@@ -132,9 +163,9 @@ defmodule DevpulseAgent.Agent do
 
   defp finalize_success(state, remaining_events) do
     if remaining_events == [] do
-      Buffer.clear!()
+      Buffer.clear!(state.buffer_file)
     else
-      Buffer.replace!(remaining_events)
+      Buffer.replace!(remaining_events, state.buffer_file)
     end
 
     Logger.debug("Heartbeat flowing for team #{state.team_slug}")
@@ -150,7 +181,14 @@ defmodule DevpulseAgent.Agent do
   end
 
   defp buffer_failure(heartbeat_event, remaining_events, state, reason) do
-    Buffer.replace!(remaining_events ++ [heartbeat_event])
+    {events, dropped_count} = bound_buffer(remaining_events ++ [heartbeat_event], state)
+    Buffer.replace!(events, state.buffer_file)
+
+    if dropped_count > 0 do
+      Logger.warning(
+        "Dropped #{dropped_count} buffered heartbeat(s) because the local buffer limit was reached"
+      )
+    end
 
     Logger.warning("Heartbeat buffered because #{format_reason(reason)}")
 
@@ -209,6 +247,14 @@ defmodule DevpulseAgent.Agent do
     end
   end
 
+  defp bound_buffer(events, state) do
+    Buffer.bound(
+      events,
+      state.config.max_buffer_events,
+      state.config.max_buffer_bytes
+    )
+  end
+
   defp flush_buffer([], state), do: {:ok, [], state}
 
   defp flush_buffer([event | rest], state) do
@@ -232,30 +278,43 @@ defmodule DevpulseAgent.Agent do
   end
 
   defp send_event(state, event, retried_handshake?) do
-    case state.client.heartbeat(
-           state.config.server_url,
-           state.config.token,
-           event
-         ) do
-      {:ok, _response} ->
-        {:ok, state}
+    case heartbeat_token(state) do
+      nil ->
+        {:error, :missing_session_token, state}
 
-      {:error, :unauthorized} when not retried_handshake? ->
-        case handshake(state) do
-          {:ok, refreshed_state} ->
-            send_event(refreshed_state, event, true)
+      session_token ->
+        event = Map.put(event, :session_id, state.session.session_id)
 
-          {:error, reason, failed_state} ->
-            {:error, reason, failed_state}
+        case state.client.heartbeat(
+               state.config.server_url,
+               session_token,
+               event
+             ) do
+          {:ok, _response} ->
+            {:ok, state}
+
+          {:error, :unauthorized} when not retried_handshake? ->
+            case handshake(state) do
+              {:ok, refreshed_state} ->
+                send_event(refreshed_state, event, true)
+
+              {:error, reason, failed_state} ->
+                {:error, reason, failed_state}
+            end
+
+          {:error, :unauthorized} ->
+            {:error, :unauthorized, state}
+
+          {:error, reason} ->
+            {:error, reason, state}
         end
-
-      {:error, :unauthorized} ->
-        {:error, :unauthorized, state}
-
-      {:error, reason} ->
-        {:error, reason, state}
     end
   end
+
+  defp heartbeat_token(%{session: %Session{session_token: token}})
+       when is_binary(token) and token != "", do: token
+
+  defp heartbeat_token(_state), do: nil
 
   defp ensure_session(%{force_handshake?: true} = state) do
     handshake(state)
@@ -289,7 +348,7 @@ defmodule DevpulseAgent.Agent do
         {:ok, %{"session" => session_data}} ->
           case normalize_session(session_data, context) do
             {:ok, session} ->
-              Session.save!(session)
+              Session.save!(session, state.session_file)
 
               Logger.info("Handshake succeeded for team #{state.team_slug}")
 
@@ -312,12 +371,17 @@ defmodule DevpulseAgent.Agent do
   end
 
   defp normalize_session(session_data, context) do
-    case session_data["session_id"] do
-      nil ->
+    session = Session.from_handshake_response(session_data, context)
+
+    cond do
+      is_nil(session.session_id) or session.session_id == "" ->
         {:error, :invalid_session_response}
 
-      _session_id ->
-        {:ok, Session.from_handshake_response(session_data, context)}
+      is_nil(session.session_token) or session.session_token == "" ->
+        {:error, :invalid_session_response}
+
+      true ->
+        {:ok, session}
     end
   end
 
@@ -378,6 +442,7 @@ defmodule DevpulseAgent.Agent do
 
   defp heartbeat_event(state, repo_metadata) do
     %{
+      event_id: event_id(),
       team_slug: state.team_slug,
       session_id: state.session.session_id,
       project_id: state.project_id,
@@ -412,8 +477,8 @@ defmodule DevpulseAgent.Agent do
   end
 
   defp status_snapshot(state) do
-    session = state.session || Session.load()
-    buffered = Buffer.load()
+    session = state.session || Session.load(state.session_file)
+    buffered = Buffer.load(state.buffer_file)
 
     %{
       workspace_root: state.workspace_root,
@@ -426,8 +491,20 @@ defmodule DevpulseAgent.Agent do
       offline: state.offline,
       buffered_heartbeats: length(buffered),
       heartbeat_interval_ms: state.config.heartbeat_interval_ms,
-      next_backoff_ms: state.backoff_ms
+      next_backoff_ms: state.backoff_ms,
+      lifecycle: Lifecycle.status(state.lifecycle_file)
     }
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    Lifecycle.release(state.lifecycle_file)
+    :ok
+  end
+
+  defp event_id do
+    :crypto.strong_rand_bytes(16)
+    |> Base.encode16(case: :lower)
   end
 
   defp operating_system do

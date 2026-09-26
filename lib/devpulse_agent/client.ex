@@ -4,6 +4,33 @@ defmodule DevpulseAgent.Client do
   """
 
   @doc """
+  Checks whether the configured DevPulse server responds to an HTTP request.
+
+  Any HTTP response means that the server is reachable; the status code is returned
+  so callers can distinguish network failures from application-level responses.
+  """
+  def check_server(base_url) when is_binary(base_url) do
+    url = String.trim_trailing(base_url, "/")
+
+    case Req.get(url,
+           retry: false,
+           receive_timeout: 5_000,
+           connect_options: [timeout: 5_000]
+         ) do
+      {:ok, %Req.Response{status: status}} when is_integer(status) ->
+        {:ok, status}
+
+      {:error, %Req.TransportError{reason: reason}} ->
+        {:error, {:transport_error, reason}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def check_server(_base_url), do: {:error, :invalid_server_url}
+
+  @doc """
   Exchanges a temporary invitation token for a permanent Personal Access Token (PAT).
   Used globally during `devpulse login`.
   """
@@ -90,8 +117,17 @@ defmodule DevpulseAgent.Client do
            :personal_access_token,
            :get
          ) do
-      {:ok, %{"status" => "success", "projects" => projects}} -> projects
-      error -> error
+      {:ok, %{"status" => "success", "projects" => projects}} when is_list(projects) ->
+        {:ok, projects}
+
+      {:ok, %{"projects" => projects}} when is_list(projects) ->
+        {:ok, projects}
+
+      {:ok, body} ->
+        {:error, {:invalid_projects_response, body}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -119,13 +155,13 @@ defmodule DevpulseAgent.Client do
   @doc """
   Streams telemetry state payloads back to the ingestion loops.
   """
-  def heartbeat(base_url, token, attrs) do
+  def heartbeat(base_url, session_token, attrs) do
     request(
       base_url,
       "/cli/agent/heartbeats",
-      token,
+      session_token,
       heartbeat_payload(attrs),
-      :personal_access_token,
+      :session,
       :post
     )
   end
@@ -144,9 +180,9 @@ defmodule DevpulseAgent.Client do
       {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
         {:ok, normalize_body(body)}
 
-      # Pass the normalized body along with status-specific tags
-      {:ok, %Req.Response{status: 401, body: body}} ->
-        {:error, {:unauthorized, normalize_body(body)}}
+      # Unauthorized responses share one shape so the agent can refresh the session.
+      {:ok, %Req.Response{status: 401, body: _body}} ->
+        {:error, :unauthorized}
 
       {:ok, %Req.Response{status: 403, body: body}} ->
         {:error, {:forbidden, normalize_body(body)}}
@@ -175,8 +211,8 @@ defmodule DevpulseAgent.Client do
       {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
         {:ok, normalize_body(body)}
 
-      {:ok, %Req.Response{status: 401, body: body}} ->
-        {:error, {:unauthorized, normalize_body(body)}}
+      {:ok, %Req.Response{status: 401, body: _body}} ->
+        {:error, :unauthorized}
 
       {:ok, %Req.Response{status: 403, body: body}} ->
         {:error, {:forbidden, normalize_body(body)}}
@@ -213,15 +249,21 @@ defmodule DevpulseAgent.Client do
 
   defp heartbeat_payload(attrs) do
     %{
-      team_slug: attrs[:team_slug],
-      session_id: attrs[:session_id],
-      project_name: attrs[:project_name],
-      git_branch: attrs[:git_branch],
-      repo_path: attrs[:repo_path],
-      has_uncommitted_changes: attrs[:has_uncommitted_changes],
-      captured_at: attrs[:captured_at] || DateTime.utc_now() |> DateTime.to_iso8601()
+      event_id: attr(attrs, :event_id),
+      team_slug: attr(attrs, :team_slug),
+      session_id: attr(attrs, :session_id),
+      project_id: attr(attrs, :project_id),
+      project_name: attr(attrs, :project_name),
+      git_branch: attr(attrs, :git_branch),
+      repo_path: attr(attrs, :repo_path),
+      has_uncommitted_changes: attr(attrs, :has_uncommitted_changes),
+      captured_at: attr(attrs, :captured_at) || DateTime.utc_now() |> DateTime.to_iso8601()
     }
     |> drop_nils()
+  end
+
+  defp attr(attrs, key) do
+    Map.get(attrs, key, Map.get(attrs, Atom.to_string(key)))
   end
 
   defp drop_nils(map) do

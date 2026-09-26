@@ -6,13 +6,16 @@ defmodule DevpulseAgent.Config do
   @config_filename "config.toml"
   @session_filename "session.json"
   @buffer_filename "buffer.ndjson"
+  @pending_assignment_filename "pending_assignment.json"
 
   @default_heartbeat_interval_ms 5_000
   @default_offline_retention_ms 24 * 60 * 60 * 1000
+  @default_max_buffer_events 10_000
+  @default_max_buffer_bytes 10 * 1024 * 1024
 
   def default_config do
     %{
-      server_url: System.get_env("api_base_url", "http://localhost:4000"),
+      server_url: System.get_env("DEVPULSE_SERVER_URL", "http://localhost:4000/api/v1"),
       token: empty_to_nil(System.get_env("DEVPULSE_TOKEN")),
       default_team: empty_to_nil(System.get_env("DEVPULSE_TEAM")),
       team: %{},
@@ -20,6 +23,8 @@ defmodule DevpulseAgent.Config do
         env_int("DEVPULSE_HEARTBEAT_INTERVAL_MS", @default_heartbeat_interval_ms),
       offline_retention_ms:
         env_int("DEVPULSE_OFFLINE_RETENTION_MS", @default_offline_retention_ms),
+      max_buffer_events: env_int("DEVPULSE_MAX_BUFFER_EVENTS", @default_max_buffer_events),
+      max_buffer_bytes: env_int("DEVPULSE_MAX_BUFFER_BYTES", @default_max_buffer_bytes),
       log_level: System.get_env("DEVPULSE_LOG_LEVEL", "info"),
       workspace_mappings: [],
       team_mappings: []
@@ -27,6 +32,16 @@ defmodule DevpulseAgent.Config do
   end
 
   def config_dir do
+    case Application.get_env(:devpulse_agent, :config_dir) do
+      path when is_binary(path) ->
+        Path.expand(path)
+
+      _ ->
+        default_config_dir()
+    end
+  end
+
+  defp default_config_dir do
     case :os.type() do
       {:win32, _} ->
         Path.join(System.get_env("APPDATA", System.user_home!()), "DevPulse")
@@ -42,17 +57,46 @@ defmodule DevpulseAgent.Config do
   def config_file, do: Path.join(config_dir(), @config_filename)
   def session_file, do: Path.join(config_dir(), @session_filename)
   def buffer_file, do: Path.join(config_dir(), @buffer_filename)
+  def pending_assignment_file, do: Path.join(config_dir(), @pending_assignment_filename)
+
+  def state_dir(workspace_root, project_id) do
+    workspace_key =
+      workspace_root
+      |> Path.expand()
+      |> then(fn value -> :crypto.hash(:sha256, value) end)
+      |> Base.encode16(case: :lower)
+
+    project_key =
+      project_id
+      |> to_string()
+      |> then(fn value -> :crypto.hash(:sha256, value) end)
+      |> Base.encode16(case: :lower)
+
+    Path.join([config_dir(), "workspaces", workspace_key <> "-" <> project_key])
+  end
+
+  def state_file(workspace_root, project_id, filename) do
+    Path.join(state_dir(workspace_root, project_id), filename)
+  end
 
   def workspace_config_file(workspace_root), do: Path.join(workspace_root, ".devpulse.toml")
 
   def load do
-    if File.exists?(config_file()) do
-      config_file() |> File.read!() |> parse_config()
-    else
-      default_config()
-    end
-    |> merge_defaults()
+    config =
+      case File.read(config_file()) do
+        {:ok, contents} -> parse_config(contents)
+        {:error, :enoent} -> default_config()
+        {:error, _reason} -> default_config()
+      end
+
+    merge_defaults(config)
+  rescue
+    _reason ->
+      quarantine_corrupt_file(config_file())
+      merge_defaults(default_config())
   end
+
+  def normalize(config) when is_map(config), do: merge_defaults(config)
 
   def save!(config) when is_map(config) do
     ensure_config_dir!()
@@ -111,11 +155,14 @@ defmodule DevpulseAgent.Config do
   def load_workspace_config(workspace_root) do
     file = workspace_config_file(workspace_root)
 
-    if File.exists?(file) do
-      File.read!(file) |> parse_config()
-    else
-      %{}
+    case File.read(file) do
+      {:ok, contents} -> parse_config(contents)
+      {:error, _reason} -> %{}
     end
+  rescue
+    _reason ->
+      quarantine_corrupt_file(workspace_config_file(workspace_root))
+      %{}
   end
 
   # def save_workspace_config!(workspace_root, attrs) when is_map(attrs) do
@@ -169,76 +216,123 @@ defmodule DevpulseAgent.Config do
     :ok
   end
 
-  def load_session do
-    file = session_file()
+  def load_session(file \\ session_file()) do
+    case File.read(file) do
+      {:ok, contents} ->
+        case Jason.decode(contents) do
+          {:ok, session} when is_map(session) -> stringify_keys(session)
+          _ -> quarantine_corrupt_file(file)
+        end
 
-    if File.exists?(file) do
-      File.read!(file) |> Jason.decode!() |> stringify_keys()
-    else
-      nil
+      {:error, :enoent} ->
+        nil
+
+      {:error, _reason} ->
+        nil
     end
   end
 
-  def save_session!(session) when is_map(session) do
-    ensure_config_dir!()
-
+  def save_session!(session, file \\ session_file()) when is_map(session) do
     session
     |> stringify_keys()
     |> Jason.encode!(pretty: true)
-    |> write_secure!(session_file())
+    |> write_secure!(file)
   end
 
-  def clear_session! do
-    File.rm(session_file())
-    :ok
+  def clear_session!(file \\ session_file()) do
+    remove_file(file)
   end
 
-  def load_buffer do
-    file = buffer_file()
-
-    if File.exists?(file) do
-      file
-      |> File.read!()
-      |> String.split("\n", trim: true)
-      |> Enum.flat_map(fn line ->
-        case Jason.decode(line) do
-          {:ok, event} -> [stringify_keys(event)]
-          _ -> []
+  def load_pending_assignment(file \\ pending_assignment_file()) do
+    case File.read(file) do
+      {:ok, contents} ->
+        case Jason.decode(contents) do
+          {:ok, assignment} when is_map(assignment) -> assignment
+          _ -> quarantine_corrupt_file(file)
         end
-      end)
-    else
-      []
+
+      {:error, :enoent} ->
+        nil
+
+      {:error, _reason} ->
+        nil
     end
   end
 
-  def save_buffer!(events) when is_list(events) do
-    ensure_config_dir!()
+  def save_pending_assignment!(assignment, file \\ pending_assignment_file())
+      when is_map(assignment) do
+    assignment
+    |> stringify_keys()
+    |> Jason.encode!(pretty: true)
+    |> write_secure!(file)
+  end
 
+  def clear_pending_assignment!(file \\ pending_assignment_file()) do
+    remove_file(file)
+  end
+
+  def load_buffer(file \\ buffer_file()) do
+    case File.read(file) do
+      {:ok, contents} ->
+        {events, malformed?} =
+          contents
+          |> String.split("\\n", trim: true)
+          |> Enum.reduce({[], false}, fn line, {events, malformed?} ->
+            case Jason.decode(line) do
+              {:ok, event} when is_map(event) ->
+                {[stringify_keys(event) | events], malformed?}
+
+              _ ->
+                {events, true}
+            end
+          end)
+
+        if malformed? do
+          quarantine_corrupt_file(file)
+        end
+
+        Enum.reverse(events)
+
+      {:error, :enoent} ->
+        []
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  def save_buffer!(events, file \\ buffer_file()) when is_list(events) do
     serialized =
       events
       |> Enum.map(&Jason.encode!/1)
-      |> Enum.join("\n")
+      |> Enum.join("\\n")
 
     contents =
       case serialized do
         "" -> ""
-        _ -> serialized <> "\n"
+        _ -> serialized <> "\\n"
       end
 
-    write_secure!(buffer_file(), contents)
+    write_secure!(file, contents)
   end
 
-  def append_buffer_event!(event) when is_map(event) do
-    ensure_config_dir!()
+  def append_buffer_event!(event, file \\ buffer_file()) when is_map(event) do
+    ensure_parent_dir!(file)
 
-    payload = Jason.encode!(stringify_keys(event)) <> "\n"
-    File.write!(buffer_file(), payload, [:append])
-    secure_file!(buffer_file())
+    payload = Jason.encode!(stringify_keys(event)) <> "\\n"
+
+    case File.write(file, payload, [:append]) do
+      :ok ->
+        secure_file!(file)
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "write", path: file
+    end
   end
 
-  def delete_buffer! do
-    File.rm(buffer_file())
-    :ok
+  def delete_buffer!(file \\ buffer_file()) do
+    remove_file(file)
   end
 
   def parse_integer(value) when is_binary(value) do
@@ -323,6 +417,8 @@ defmodule DevpulseAgent.Config do
       :default_team,
       :heartbeat_interval_ms,
       :offline_retention_ms,
+      :max_buffer_events,
+      :max_buffer_bytes,
       :log_level
     ]
 
@@ -357,10 +453,11 @@ defmodule DevpulseAgent.Config do
           "[[workspace]]",
           "path = #{encode_value(mapping[:path] || mapping["path"])}"
         ] ++
-          case mapping[:project_slug] || mapping["project_slug"] do
-            nil -> []
-            slug -> ["project_slug = #{encode_value(slug)}"]
-          end
+          optional_config_lines([
+            {"team_slug", mapping[:team_slug] || mapping["team_slug"]},
+            {"project_slug", mapping[:project_slug] || mapping["project_slug"]},
+            {"remote_url", mapping[:remote_url] || mapping["remote_url"]}
+          ])
       end)
 
     ([top_level] ++ [team_block] ++ [workspace_blocks])
@@ -369,7 +466,15 @@ defmodule DevpulseAgent.Config do
     |> Kernel.<>("\n")
   end
 
-  # Glory
+  defp optional_config_lines(entries) do
+    Enum.flat_map(entries, fn {key, value} ->
+      case value do
+        nil -> []
+        value -> ["#{key} = #{encode_value(value)}"]
+      end
+    end)
+  end
+
   defp encode_workspace_config(config) do
     team = config[:team] || config["team"] || %{}
     project = config[:project] || config["project"] || %{}
@@ -469,6 +574,7 @@ defmodule DevpulseAgent.Config do
     %{
       path: mapping[:path] || mapping["path"],
       team_slug: mapping[:team_slug] || mapping["team_slug"],
+      project_slug: mapping[:project_slug] || mapping["project_slug"],
       remote_url: mapping[:remote_url] || mapping["remote_url"]
     }
   end
@@ -508,6 +614,29 @@ defmodule DevpulseAgent.Config do
     File.mkdir_p!(config_dir())
   end
 
+  defp ensure_parent_dir!(path) do
+    path
+    |> Path.dirname()
+    |> File.mkdir_p!()
+  end
+
+  defp remove_file(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> raise File.Error, reason: reason, action: "delete", path: path
+    end
+  end
+
+  defp quarantine_corrupt_file(path) do
+    quarantine = path <> ".corrupt-" <> Integer.to_string(System.system_time(:second))
+
+    case File.rename(path, quarantine) do
+      :ok -> nil
+      {:error, _reason} -> nil
+    end
+  end
+
   defp ensure_workspace_dir(workspace_root) do
     Path.expand(workspace_root)
     |> File.mkdir_p()
@@ -520,8 +649,17 @@ defmodule DevpulseAgent.Config do
   end
 
   defp write_secure!(contents, path) do
-    File.write!(path, contents)
-    secure_file!(path)
+    ensure_parent_dir!(path)
+    temporary = path <> ".tmp-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    try do
+      File.write!(temporary, contents)
+      secure_file!(temporary)
+      File.rename!(temporary, path)
+      secure_file!(path)
+    after
+      File.rm(temporary)
+    end
   end
 
   defp stringify_keys(map) when is_map(map) do

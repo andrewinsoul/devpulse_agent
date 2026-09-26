@@ -59,19 +59,13 @@ defmodule DevpulseAgent.Workspace do
     local_config =
       Config.load_workspace_config(workspace_root)
 
-    case local_config do
-      %{
-        project_id: project_id,
-        project_name: project_name
-      } ->
-        {:ok,
-         %{
-           project_id: project_id,
-           project_name: project_name
-         }}
+    project_id = local_config[:project_id] || local_config["project_id"]
+    project_name = local_config[:project_name] || local_config["project_name"]
 
-      _ ->
-        {:error, "project info not found, reinitialize the project..."}
+    if present?(project_id) and present?(project_name) do
+      {:ok, %{project_id: project_id, project_name: project_name}}
+    else
+      {:error, :project_not_initialized}
     end
   end
 
@@ -111,6 +105,8 @@ defmodule DevpulseAgent.Workspace do
   #     {:error, reason} -> raise "failed to link team: #{inspect(reason)}"
   #   end
   # end
+
+  defp present?(value), do: is_binary(value) and String.trim(value) != ""
 
   def workspace_mapping_summary(workspace_root) do
     local_config = Config.load_workspace_config(workspace_root)
